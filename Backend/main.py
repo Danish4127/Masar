@@ -201,6 +201,14 @@ def ensure_student_columns():
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_student_email ON student(email) WHERE email IS NOT NULL AND email <> ''"))
         conn.execute(text("""CREATE TABLE IF NOT EXISTS course_ratings (rating_id SERIAL PRIMARY KEY, student_id VARCHAR(20) REFERENCES student(student_id) ON DELETE CASCADE, course_id INT REFERENCES course(course_id) ON DELETE CASCADE, difficulty_rating INT NOT NULL CHECK (difficulty_rating BETWEEN 1 AND 5), workload_rating INT NOT NULL CHECK (workload_rating BETWEEN 1 AND 5), comment TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(student_id, course_id))"""))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_course_ratings_course ON course_ratings(course_id)"))
+        # OTP flow now also covers signup + login (previously reset-password only).
+        # student_id stays nullable (a pending signup has no student row yet), and the
+        # new columns default so the existing reset-password rows/queries are unaffected.
+        conn.execute(text("ALTER TABLE password_reset_otp ALTER COLUMN student_id DROP NOT NULL"))
+        conn.execute(text("ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS purpose VARCHAR(20) NOT NULL DEFAULT 'reset'"))
+        conn.execute(text("ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS identifier TEXT"))
+        conn.execute(text("ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS payload JSONB"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_password_reset_otp_identifier ON password_reset_otp(identifier, purpose, created_at DESC)"))
 
 
 def _sync_completed_courses(conn, student_id: str, course_codes: List[str], grades: dict[str, str] | None = None):
@@ -296,55 +304,72 @@ def get_courses():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/students/signup")
-def signup(profile: StudentProfileRequest):
-    if not profile.password or len(profile.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
-    if not profile.privacy_consent:
-        raise HTTPException(status_code=400, detail="Privacy consent is required to create an account.")
-    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@uaeu\.ac\.ae", (profile.email or "").strip(), flags=re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Please use your official UAEU email address ending in @uaeu.ac.ae.")
-    try:
-        with engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT student_id FROM student WHERE student_id = :sid OR (email = :email AND :email <> '')"),
-                {"sid": profile.student_id, "email": (profile.email or "").strip().lower()},
-            ).mappings().fetchone()
-            if existing:
-                raise HTTPException(
-                    status_code=409,
-                    detail="An account with this Student ID or email already exists. Please sign in instead.",
-                )
-
-            _upsert_student(conn, profile)
-            _sync_completed_courses(conn, profile.student_id, profile.completed_courses, profile.completed_grades)
-
-                                                                           
-        student_data = {
+def _signup_response(profile: StudentProfileRequest) -> dict:
+    student_data = {
+        "gpa": profile.gpa,
+        "math_confidence": profile.math_confidence,
+        "programming_confidence": profile.programming_confidence,
+        "workload_tolerance": profile.workload_tolerance,
+    }
+    plans = generate_all_plans(student_data, profile.completed_courses)
+    return {
+        "success": True,
+        "access_token": _issue_token(profile.student_id),
+        "student": _student_profile_from_row({
+            "student_id": profile.student_id,
+            "full_name": profile.full_name,
+            "email": profile.email,
+            "major": profile.academic_major,
             "gpa": profile.gpa,
             "math_confidence": profile.math_confidence,
             "programming_confidence": profile.programming_confidence,
             "workload_tolerance": profile.workload_tolerance,
-        }
-        plans = generate_all_plans(student_data, profile.completed_courses)
+        }),
+        "completed_courses": [normalize_course_code(c) for c in profile.completed_courses],
+        "completed_grades": profile.completed_grades,
+        "plans": plans,
+    }
 
-        return {
-            "success": True,
-            "access_token": _issue_token(profile.student_id),
-            "student": _student_profile_from_row({
-                "student_id": profile.student_id,
-                "full_name": profile.full_name,
-                "email": profile.email,
-                "major": profile.academic_major,
-                "gpa": profile.gpa,
-                "math_confidence": profile.math_confidence,
-                "programming_confidence": profile.programming_confidence,
-                "workload_tolerance": profile.workload_tolerance,
-            }),
-            "completed_courses": [normalize_course_code(c) for c in profile.completed_courses],
-            "completed_grades": profile.completed_grades,
-            "plans": plans,
-        }
+
+def _check_signup_conflict(conn, student_id: str, email: str):
+    existing = conn.execute(
+        text("SELECT student_id FROM student WHERE student_id = :sid OR (email = :email AND :email <> '')"),
+        {"sid": student_id, "email": email},
+    ).mappings().fetchone()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this Student ID or email already exists. Please sign in instead.",
+        )
+
+
+def _validate_signup_profile(profile: StudentProfileRequest) -> str:
+    """Runs the same checks the direct /students/signup endpoint always ran,
+    so a bad signup never gets as far as sending an OTP email. Returns the
+    normalized email."""
+    if not profile.password or len(profile.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    if not profile.privacy_consent:
+        raise HTTPException(status_code=400, detail="Privacy consent is required to create an account.")
+    email = (profile.email or "").strip().lower()
+    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@uaeu\.ac\.ae", email, flags=re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Please use your official UAEU email address ending in @uaeu.ac.ae.")
+    return email
+
+
+@app.post("/students/signup")
+def signup(profile: StudentProfileRequest):
+    """Kept for direct/scripted account creation (e.g. the synthetic data
+    generator) that intentionally bypasses the OTP flow. Real users go
+    through /students/signup/request-otp + /students/signup/verify-otp
+    instead (see Auth() in the frontend)."""
+    email = _validate_signup_profile(profile)
+    try:
+        with engine.begin() as conn:
+            _check_signup_conflict(conn, profile.student_id, email)
+            _upsert_student(conn, profile)
+            _sync_completed_courses(conn, profile.student_id, profile.completed_courses, profile.completed_grades)
+        return _signup_response(profile)
     except HTTPException:
         raise
     except Exception as e:
@@ -353,6 +378,10 @@ def signup(profile: StudentProfileRequest):
 
 @app.post("/students/login")
 def login(payload: LoginRequest):
+    """Verifies the password, then requires an OTP for accounts that have an
+    email on file (all real signups do). Accounts without an email (e.g.
+    synthetic/test data seeded directly into the DB) log in immediately,
+    since there is nowhere to send a code."""
     try:
         with engine.connect() as conn:
             identifier = payload.identifier.strip()
@@ -365,27 +394,165 @@ def login(payload: LoginRequest):
             if not _verify_password(payload.password, row.get("password_hash")):
                 raise HTTPException(status_code=401, detail="Invalid username/email or password.")
 
-            completed = conn.execute(
-                text("""
-                    SELECT c.course_code, c.course_name, c.credits, cc.grade
-                    FROM completed_courses cc
-                    JOIN course c ON c.course_id = cc.course_id
-                    WHERE cc.student_id = :sid
-                    ORDER BY c.course_code
-                """),
-                {"sid": row["student_id"]},
-            ).mappings().all()
+            email = (row.get("email") or "").strip()
+            if not email:
+                completed = conn.execute(
+                    text("""
+                        SELECT c.course_code, c.course_name, c.credits, cc.grade
+                        FROM completed_courses cc
+                        JOIN course c ON c.course_id = cc.course_id
+                        WHERE cc.student_id = :sid
+                        ORDER BY c.course_code
+                    """),
+                    {"sid": row["student_id"]},
+                ).mappings().all()
+                return {
+                    "success": True,
+                    "otp_required": False,
+                    "access_token": _issue_token(row["student_id"]),
+                    "student": _student_profile_from_row(row),
+                    "completed_courses": [dict(c) for c in completed],
+                }
 
-        return {
-            "success": True,
-            "access_token": _issue_token(row["student_id"]),
-            "student": _student_profile_from_row(row),
-            "completed_courses": [dict(c) for c in completed],
-        }
+        with engine.begin() as conn:
+            otp_code = _generate_otp()
+            conn.execute(
+                text("""
+                    INSERT INTO password_reset_otp (student_id, identifier, purpose, otp_hash, expires_at)
+                    VALUES (:sid, :identifier, 'login', :otp_hash, NOW() + INTERVAL '10 minutes')
+                """),
+                {"sid": row["student_id"], "identifier": row["student_id"], "otp_hash": _hash_otp(otp_code)},
+            )
+            send_otp_email(email, otp_code)
+
+        return {"success": True, "otp_required": True, "student_id": row["student_id"], "message": "A verification code has been sent to your registered email."}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class LoginVerifyRequest(BaseModel):
+    identifier: str
+    otp_code: str
+
+
+@app.post("/students/login/verify-otp")
+def login_verify_otp(payload: LoginVerifyRequest):
+    """Second step of login for accounts with an email on file: confirms the
+    OTP sent by /students/login and only then issues the access token."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT * FROM student WHERE student_id = :identifier OR LOWER(email) = LOWER(:identifier) LIMIT 1"),
+            {"identifier": payload.identifier.strip()},
+        ).mappings().fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="Invalid or expired code.")
+
+        otp_row = conn.execute(
+            text("""
+                SELECT otp_id FROM password_reset_otp
+                WHERE identifier = :sid AND purpose = 'login' AND otp_hash = :otp_hash
+                  AND used = FALSE AND expires_at > NOW()
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"sid": row["student_id"], "otp_hash": _hash_otp(payload.otp_code.strip())},
+        ).mappings().fetchone()
+        if not otp_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired code.")
+
+        conn.execute(text("UPDATE password_reset_otp SET used = TRUE WHERE otp_id = :oid"), {"oid": otp_row["otp_id"]})
+
+        completed = conn.execute(
+            text("""
+                SELECT c.course_code, c.course_name, c.credits, cc.grade
+                FROM completed_courses cc
+                JOIN course c ON c.course_id = cc.course_id
+                WHERE cc.student_id = :sid
+                ORDER BY c.course_code
+            """),
+            {"sid": row["student_id"]},
+        ).mappings().all()
+
+    return {
+        "success": True,
+        "access_token": _issue_token(row["student_id"]),
+        "student": _student_profile_from_row(row),
+        "completed_courses": [dict(c) for c in completed],
+    }
+
+
+class SignupOtpRequest(StudentProfileRequest):
+    pass
+
+
+class SignupVerifyRequest(BaseModel):
+    email: str
+    otp_code: str
+
+
+@app.post("/students/signup/request-otp")
+def signup_request_otp(profile: SignupOtpRequest):
+    """Validates the signup exactly like /students/signup would, but instead
+    of creating the account immediately, stashes it (password already
+    hashed) against an OTP and emails the code. The account is only created
+    once /students/signup/verify-otp confirms the code."""
+    email = _validate_signup_profile(profile)
+    with engine.begin() as conn:
+        _check_signup_conflict(conn, profile.student_id, email)
+
+        pending = profile.model_dump()
+        pending.pop("password", None)
+        pending["password_hash"] = _hash_password(profile.password)
+        pending["email"] = email
+
+        otp_code = _generate_otp()
+        conn.execute(
+            text("""
+                INSERT INTO password_reset_otp (identifier, purpose, otp_hash, payload, expires_at)
+                VALUES (:identifier, 'signup', :otp_hash, CAST(:payload AS JSONB), NOW() + INTERVAL '10 minutes')
+            """),
+            {"identifier": email, "otp_hash": _hash_otp(otp_code), "payload": json.dumps(pending)},
+        )
+        send_otp_email(email, otp_code)
+
+    return {"success": True, "message": "Verification code sent to your UAEU email."}
+
+
+@app.post("/students/signup/verify-otp")
+def signup_verify_otp(payload: SignupVerifyRequest):
+    """Confirms the signup OTP, then actually creates the account using the
+    data captured at request-otp time."""
+    email = payload.email.strip().lower()
+    with engine.begin() as conn:
+        otp_row = conn.execute(
+            text("""
+                SELECT otp_id, payload FROM password_reset_otp
+                WHERE identifier = :identifier AND purpose = 'signup' AND otp_hash = :otp_hash
+                  AND used = FALSE AND expires_at > NOW()
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"identifier": email, "otp_hash": _hash_otp(payload.otp_code.strip())},
+        ).mappings().fetchone()
+        if not otp_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired code.")
+
+        data = otp_row["payload"]
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        _check_signup_conflict(conn, data["student_id"], email)
+
+        profile = StudentProfileRequest(**{k: v for k, v in data.items() if k != "password_hash"})
+        _upsert_student(conn, profile)
+        conn.execute(
+            text("UPDATE student SET password_hash = :ph WHERE student_id = :sid"),
+            {"ph": data["password_hash"], "sid": profile.student_id},
+        )
+        _sync_completed_courses(conn, profile.student_id, profile.completed_courses, profile.completed_grades)
+        conn.execute(text("UPDATE password_reset_otp SET used = TRUE WHERE otp_id = :oid"), {"oid": otp_row["otp_id"]})
+
+    return _signup_response(profile)
 
 
 class ForgotPasswordRequest(BaseModel):

@@ -133,10 +133,36 @@ function Auth({ courses, onAuthenticated, onHelp }: { courses: Course[]; onAuthe
   const [completed, setCompleted] = useState<string[]>([]); const [grades, setGrades] = useState<Record<string,string>>({}); const [q, setQ] = useState(""); const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [showPassword, setShowPassword] = useState(false);
   const [resetStep, setResetStep] = useState<"request"|"verify"|"done">("request");
   const [resetOtp, setResetOtp] = useState(""); const [resetPassword, setResetPassword] = useState(""); const [resetInfo, setResetInfo] = useState("");
+  const [authOtpStep, setAuthOtpStep] = useState(false); const [authOtp, setAuthOtp] = useState(""); const [authOtpInfo, setAuthOtpInfo] = useState("");
   const filtered = useMemo(() => courses.filter(c => `${c.course_code} ${c.course_name}`.toLowerCase().includes(q.toLowerCase())).sort((a,b)=>Number(completed.includes(b.course_code))-Number(completed.includes(a.course_code))), [courses, q, completed]);
   const forgot = () => { setError(""); setResetInfo(""); setResetStep("request"); setResetOtp(""); setResetPassword(""); setMode("reset"); };
   const requestOtp = async () => { setError(""); if (!form.student_id.trim()) return setError(t("auth.enterIdentifierFirst")); setBusy(true); try { const d = await api<{message:string}>("/students/forgot-password", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim()})}); setResetInfo(d.message); setResetStep("verify"); } catch (e) { setError(e instanceof Error ? e.message : t("auth.couldNotStartRecovery")); } finally { setBusy(false); } };
   const confirmReset = async () => { setError(""); if (!resetOtp.trim()) return setError(t("auth.enterCode")); if (resetPassword.length < 8) return setError(t("auth.passwordTooShort")); setBusy(true); try { await api<{success:boolean;message:string}>("/students/reset-password", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim(), otp_code:resetOtp.trim(), new_password:resetPassword})}); setResetStep("done"); } catch (e) { setError(e instanceof Error ? e.message : t("auth.couldNotReset")); } finally { setBusy(false); } };
+  const cancelAuthOtp = () => { setAuthOtpStep(false); setAuthOtp(""); setAuthOtpInfo(""); setError(""); };
+  const resendAuthOtp = async () => {
+    setError(""); setBusy(true);
+    try {
+      if (mode === "login") {
+        const d = await api<{message:string}>("/students/login", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim(),password:form.password})});
+        setAuthOtpInfo(d.message || t("auth.otpResent"));
+      } else {
+        const d = await api<{message:string}>("/students/signup/request-otp", {method:"POST", body:JSON.stringify({...form,gpa:Number(form.gpa),completed_courses:completed,completed_grades:grades,plan_type:"balanced",privacy_consent:privacyConsent})});
+        setAuthOtpInfo(d.message || t("auth.otpResent"));
+      }
+    } catch (e) { setError(e instanceof Error ? e.message : t("auth.couldNotStartRecovery")); } finally { setBusy(false); }
+  };
+  const confirmAuthOtp = async () => {
+    setError(""); if (!authOtp.trim()) return setError(t("auth.enterCode")); setBusy(true);
+    try {
+      if (mode === "login") {
+        const d = await api<{student:Student;completed_courses:Course[];access_token:string}>("/students/login/verify-otp", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim(), otp_code:authOtp.trim()})});
+        sessionStorage.setItem("masar_student_id", d.student.student_id); sessionStorage.setItem("masar_access_token", d.access_token); await onAuthenticated(d.student, (d.completed_courses||[]).map(c=>typeof c === "string" ? normalizeCourseCode(c) : normalizeCourseCode(c.course_code)), undefined, Object.fromEntries((d.completed_courses||[]).filter(c=>typeof c!=="string" && c.grade).map((c:any)=>[normalizeCourseCode(c.course_code), c.grade])));
+      } else {
+        const d = await api<{student:Student;completed_courses:string[];plans:Plans;access_token:string}>("/students/signup/verify-otp", {method:"POST", body:JSON.stringify({email:form.email.trim(), otp_code:authOtp.trim()})});
+        sessionStorage.setItem("masar_student_id", d.student.student_id); sessionStorage.setItem("masar_access_token", d.access_token); await onAuthenticated(d.student, (d.completed_courses||[]).map(normalizeCourseCode), d.plans, grades);
+      }
+    } catch (e) { setError(e instanceof Error ? e.message : t("auth.couldNotVerifyOtp")); } finally { setBusy(false); }
+  };
   const submit = async () => {
     setError("");
     if (!form.password) return setError(t("auth.enterPassword"));
@@ -148,11 +174,15 @@ function Auth({ courses, onAuthenticated, onHelp }: { courses: Course[]; onAuthe
     setBusy(true);
     try {
       if (mode === "login") {
-        const d = await api<{student:Student;completed_courses:Course[];access_token:string}>("/students/login", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim(),password:form.password})});
-        sessionStorage.setItem("masar_student_id", d.student.student_id); sessionStorage.setItem("masar_access_token", d.access_token); await onAuthenticated(d.student, (d.completed_courses||[]).map(c=>typeof c === "string" ? normalizeCourseCode(c) : normalizeCourseCode(c.course_code)), undefined, Object.fromEntries((d.completed_courses||[]).filter(c=>typeof c!=="string" && c.grade).map((c:any)=>[normalizeCourseCode(c.course_code), c.grade])));
+        const d = await api<{student?:Student;completed_courses?:Course[];access_token?:string;otp_required?:boolean;message?:string}>("/students/login", {method:"POST", body:JSON.stringify({identifier:form.student_id.trim(),password:form.password})});
+        if (d.otp_required) {
+          setAuthOtpInfo(d.message || t("auth.otpSentLogin")); setAuthOtp(""); setAuthOtpStep(true);
+        } else if (d.student && d.access_token) {
+          sessionStorage.setItem("masar_student_id", d.student.student_id); sessionStorage.setItem("masar_access_token", d.access_token); await onAuthenticated(d.student, (d.completed_courses||[]).map(c=>typeof c === "string" ? normalizeCourseCode(c) : normalizeCourseCode(c.course_code)), undefined, Object.fromEntries((d.completed_courses||[]).filter(c=>typeof c!=="string" && c.grade).map((c:any)=>[normalizeCourseCode(c.course_code), c.grade])));
+        }
       } else {
-        const d = await api<{student:Student;completed_courses:string[];plans:Plans;access_token:string}>("/students/signup", {method:"POST", body:JSON.stringify({...form,gpa:Number(form.gpa),completed_courses:completed,completed_grades:grades,plan_type:"balanced",privacy_consent:privacyConsent})});
-        sessionStorage.setItem("masar_student_id", d.student.student_id); sessionStorage.setItem("masar_access_token", d.access_token); await onAuthenticated(d.student, (d.completed_courses||[]).map(normalizeCourseCode), d.plans, grades);
+        const d = await api<{message:string}>("/students/signup/request-otp", {method:"POST", body:JSON.stringify({...form,gpa:Number(form.gpa),completed_courses:completed,completed_grades:grades,plan_type:"balanced",privacy_consent:privacyConsent})});
+        setAuthOtpInfo(d.message || t("auth.otpSentSignup")); setAuthOtp(""); setAuthOtpStep(true);
       }
     } catch(e) { setError(e instanceof Error ? e.message : t("auth.unableToConnect")); } finally { setBusy(false); }
   };
@@ -160,8 +190,17 @@ function Auth({ courses, onAuthenticated, onHelp }: { courses: Course[]; onAuthe
     <div className="auth-header"><Logo/><LanguageToggle/><button className="auth-help" onClick={() => onHelp(t("auth.help"), <p>{t("auth.helpBody")}</p>)}><CircleHelp size={15}/> {t("auth.help")}</button></div>
     <div className="auth-stage">
       <div className="auth-card">
-        <div className="auth-card-head"><h1>{mode === "login" ? t("auth.welcomeBack") : mode === "reset" ? t("auth.resetPassword") : t("auth.createAccount")}</h1><p>{mode === "login" ? t("auth.welcomeBackSub") : mode === "reset" ? t("auth.resetPasswordSub") : t("auth.createAccountSub")}</p></div>
-        {mode === "reset" ? (
+        <div className="auth-card-head"><h1>{authOtpStep ? t("auth.verifyItsYou") : mode === "login" ? t("auth.welcomeBack") : mode === "reset" ? t("auth.resetPassword") : t("auth.createAccount")}</h1><p>{authOtpStep ? t("auth.otpStepSub") : mode === "login" ? t("auth.welcomeBackSub") : mode === "reset" ? t("auth.resetPasswordSub") : t("auth.createAccountSub")}</p></div>
+        {authOtpStep ? (
+          <div className="auth-fields">
+            {authOtpInfo && <div className="info-box">{authOtpInfo}</div>}
+            <label>{t("auth.verificationCode")}<input value={authOtp} onChange={e=>setAuthOtp(e.target.value)} placeholder={t("auth.codePlaceholder")} maxLength={6} autoFocus/></label>
+            {error && <div className="error-box">{error}</div>}
+            <button type="button" className="primary-button wide" disabled={busy} onClick={confirmAuthOtp}>{busy ? <><LoadingDots label={t("auth.updating")}/> {t("auth.verifyingCode")}</> : t("auth.verifyAndContinue")}</button>
+            <button type="button" className="switch-button" onClick={resendAuthOtp} disabled={busy}>{t("auth.resendCode")}</button>
+            <button type="button" className="switch-button" onClick={cancelAuthOtp} disabled={busy}>{t("auth.backToLogin")}</button>
+          </div>
+        ) : mode === "reset" ? (
           <div className="auth-fields">
             <label>{t("auth.usernameOrEmail")}<input value={form.student_id} onChange={e=>setForm({...form,student_id:e.target.value})} placeholder={t("auth.usernameOrEmail")} disabled={resetStep!=="request"}/></label>
             {resetStep === "request" && <>
