@@ -1,0 +1,43 @@
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Node.js / Next.js
+Frontend/node_modules/
+Frontend/.next/
+Frontend/out/
+Frontend/npm-debug.log*
+Frontend/yarn-debug.log*
+Frontend/pnpm-debug.log*
+
+# Python
+Backend/venv/
+Backend/.venv/
+Backend/env/
+Backend/__pycache__/
+Backend/**/*.pyc
+Backend/.pytest_cache/
+Backend/.mypy_cache/
+Backend/.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.temp

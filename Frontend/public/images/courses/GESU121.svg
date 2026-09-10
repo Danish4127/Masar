@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 170">
+<defs><linearGradient id="bg-GESU121" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#127a5e"/><stop offset="100%" stop-color="#093d2f"/></linearGradient></defs>
+<rect width="220" height="170" rx="24" fill="url(#bg-GESU121)"/>
+<circle cx="53" cy="88" r="30" fill="#8af2d6" opacity=".08"/>
+<g transform="translate(110,85)" stroke="#8af2d6" fill="none" stroke-width="1.8">
+      <circle r="40"/>
+      <ellipse rx="17" ry="40"/>
+      <line x1="-40" y1="0" x2="40" y2="0"/>
+      <path d="M-33,-20 a55,55 0 0 0 66,0"/>
+      <path d="M-33,20 a55,55 0 0 1 66,0"/>
+    </g>
+<rect width="220" height="170" rx="24" fill="none" stroke="rgba(255,255,255,.08)"/>
+</svg>

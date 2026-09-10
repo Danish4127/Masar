@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 170">
+<defs><linearGradient id="bg-GEIT112" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0f6f78"/><stop offset="100%" stop-color="#07373c"/></linearGradient></defs>
+<rect width="220" height="170" rx="24" fill="url(#bg-GEIT112)"/>
+<circle cx="94" cy="29" r="26" fill="#87e7f0" opacity=".08"/>
+<g transform="translate(110,85)" stroke="#87e7f0" fill="none" stroke-width="1.8">
+      <circle r="40"/>
+      <ellipse rx="17" ry="40"/>
+      <line x1="-40" y1="0" x2="40" y2="0"/>
+      <path d="M-33,-20 a55,55 0 0 0 66,0"/>
+      <path d="M-33,20 a55,55 0 0 1 66,0"/>
+    </g>
+<rect width="220" height="170" rx="24" fill="none" stroke="rgba(255,255,255,.08)"/>
+</svg>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 170">
+<defs><linearGradient id="bg-CHEM111" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0e8a6f"/><stop offset="100%" stop-color="#074537"/></linearGradient></defs>
+<rect width="220" height="170" rx="24" fill="url(#bg-CHEM111)"/>
+<circle cx="39" cy="115" r="42" fill="#86ffe7" opacity=".08"/>
+<g transform="translate(105,80)">
+      <path d="M-8,-30 V-8 L-26,26 a10,10 0 0 0 9,15 h34 a10,10 0 0 0 9,-15 L0,-8 V-30" fill="#86ffe722" stroke="#86ffe7" stroke-width="2.4"/>
+      <path d="M-16,4 h32" stroke="#86ffe7" stroke-width="2"/>
+      <circle cx="-4" cy="18" r="3" fill="#86ffe7"/>
+      <circle cx="10" cy="24" r="2.4" fill="#86ffe7"/>
+    </g>
+<rect width="220" height="170" rx="24" fill="none" stroke="rgba(255,255,255,.08)"/>
+</svg>

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 170">
+<defs><linearGradient id="bg-BIOC100" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#128a4a"/><stop offset="100%" stop-color="#094525"/></linearGradient></defs>
+<rect width="220" height="170" rx="24" fill="url(#bg-BIOC100)"/>
+<circle cx="111" cy="146" r="46" fill="#8affc2" opacity=".08"/>
+<g transform="translate(110,85)" stroke="#8affc2" fill="none" stroke-width="2.2">
+      <path d="M-18,-40 C10,-20 -10,0 18,20 C10,30 -10,30 -18,40"/>
+      <path d="M18,-40 C-10,-20 10,0 -18,20 C-10,30 10,30 18,40"/>
+      <line x1="-13" y1="-28" x2="13" y2="-28"/>
+      <line x1="-8" y1="-8" x2="8" y2="-8"/>
+      <line x1="-8" y1="12" x2="8" y2="12"/>
+      <line x1="-13" y1="32" x2="13" y2="32"/>
+    </g>
+<rect width="220" height="170" rx="24" fill="none" stroke="rgba(255,255,255,.08)"/>
+</svg>
