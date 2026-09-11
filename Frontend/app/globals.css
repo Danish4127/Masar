@@ -87,7 +87,7 @@ button:not(:disabled):active{transform:translateY(1px) scale(.975)!important;box
 button { -webkit-tap-highlight-color: transparent; }
 .card-button, .primary-button, .outline-button, .ghost-button, .plan-select, .plan-details, .icon-button { touch-action: manipulation; }
 .card-button, .primary-button, .outline-button, .ghost-button { transition: transform .12s ease, opacity .12s ease, background-color .12s ease, border-color .12s ease; }
-.card-button:disabled, .primary-button:disabled { cursor: wait; }
+.card-button:disabled, .primary-button:disabled { cursor: not-allowed; }
 .card-button.added { font-weight: 800; }
 .review-actions { display:flex; justify-content:flex-end; margin-top:16px; }
 

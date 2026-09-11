@@ -32,6 +32,29 @@ app = FastAPI(title="Masar Academic Advisor API", version="2.1")
 
 AUTH_SECRET = os.getenv("AUTH_SECRET", "change-this-secret-in-production").encode("utf-8")
 AUTH_TTL_SECONDS = int(os.getenv("AUTH_TTL_SECONDS", "28800"))
+
+# Production always requires @uaeu.ac.ae. For local testing without a UAEU
+# inbox, add extra domains via .env, e.g. ALLOWED_EMAIL_DOMAINS=uaeu.ac.ae,gmail.com
+# -- Resend can deliver to any recipient domain, only the FROM domain needs
+# verification, so a personal Gmail works fine for receiving the real OTP.
+# Do NOT set this in production.
+_ALLOWED_EMAIL_DOMAINS = [
+    d.strip().lower() for d in os.getenv("ALLOWED_EMAIL_DOMAINS", "uaeu.ac.ae").split(",") if d.strip()
+]
+_EMAIL_DOMAIN_PATTERN = re.compile(
+    r"[A-Za-z0-9._%+-]+@(" + "|".join(re.escape(d) for d in _ALLOWED_EMAIL_DOMAINS) + r")$",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_allowed_email(value: str | None) -> bool:
+    return bool(value and _EMAIL_DOMAIN_PATTERN.fullmatch(value.strip()))
+
+
+def _email_domain_error() -> str:
+    if _ALLOWED_EMAIL_DOMAINS == ["uaeu.ac.ae"]:
+        return "Please use your official UAEU email address ending in @uaeu.ac.ae."
+    return f"Please use an email ending in one of: {', '.join('@' + d for d in _ALLOWED_EMAIL_DOMAINS)}."
 bearer_scheme = HTTPBearer(auto_error=False)
 
 def _issue_token(student_id: str) -> str:
@@ -118,8 +141,8 @@ class StudentProfileRequest(BaseModel):
         if value is None:
             return value
         value = value.strip().lower()
-        if value and not re.fullmatch(r"[A-Za-z0-9._%+-]+@uaeu\.ac\.ae", value):
-            raise ValueError("Email must use the @uaeu.ac.ae domain.")
+        if value and not _is_allowed_email(value):
+            raise ValueError(_email_domain_error())
         return value
 
     @field_validator("completed_grades", mode="before")
@@ -211,14 +234,22 @@ def ensure_student_columns():
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_password_reset_otp_identifier ON password_reset_otp(identifier, purpose, created_at DESC)"))
 
 
-def _sync_completed_courses(conn, student_id: str, course_codes: List[str], grades: dict[str, str] | None = None):
+def _validate_completed_grades(course_codes: List[str], grades: dict[str, str] | None = None) -> dict[str, str]:
+    """Checks every completed course has a valid passing grade. Raises
+    before any DB write / OTP email happens if not. Returns the normalized
+    grades dict so callers can reuse it."""
     grades = {normalize_course_code(k): str(v).strip().upper() for k, v in (grades or {}).items()}
     allowed = {"A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D"}
     if any(value not in allowed for value in grades.values()):
         raise HTTPException(status_code=422, detail="Only passing grades A+ through D are allowed for completed courses.")
-    missing = [code for code in course_codes if code not in grades]
+    missing = [code for code in course_codes if normalize_course_code(code) not in grades]
     if missing:
         raise HTTPException(status_code=422, detail="Select a grade for every completed course.")
+    return grades
+
+
+def _sync_completed_courses(conn, student_id: str, course_codes: List[str], grades: dict[str, str] | None = None):
+    grades = _validate_completed_grades(course_codes, grades)
     course_codes = [normalize_course_code(c) for c in course_codes if str(c).strip()]
     conn.execute(
         text("DELETE FROM completed_courses WHERE student_id = :sid"),
@@ -352,8 +383,9 @@ def _validate_signup_profile(profile: StudentProfileRequest) -> str:
     if not profile.privacy_consent:
         raise HTTPException(status_code=400, detail="Privacy consent is required to create an account.")
     email = (profile.email or "").strip().lower()
-    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@uaeu\.ac\.ae", email, flags=re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Please use your official UAEU email address ending in @uaeu.ac.ae.")
+    if not _is_allowed_email(email):
+        raise HTTPException(status_code=400, detail=_email_domain_error())
+    _validate_completed_grades(profile.completed_courses, profile.completed_grades)
     return email
 
 
@@ -795,8 +827,8 @@ def update_student(student_id: str, profile: StudentProfileRequest, credentials:
     _require_student(credentials, student_id)
     if profile.student_id != student_id:
         raise HTTPException(status_code=400, detail="Student ID in the body must match the URL.")
-    if profile.email is not None and not re.fullmatch(r"[A-Za-z0-9._%+-]+@uaeu\.ac\.ae", profile.email.strip(), flags=re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Please use your official UAEU email address ending in @uaeu.ac.ae.")
+    if profile.email is not None and not _is_allowed_email(profile.email.strip()):
+        raise HTTPException(status_code=400, detail=_email_domain_error())
     try:
         with engine.begin() as conn:
             exists = conn.execute(
