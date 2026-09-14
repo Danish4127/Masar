@@ -244,7 +244,7 @@ def _validate_completed_grades(course_codes: List[str], grades: dict[str, str] |
         raise HTTPException(status_code=422, detail="Only passing grades A+ through D are allowed for completed courses.")
     missing = [code for code in course_codes if normalize_course_code(code) not in grades]
     if missing:
-        raise HTTPException(status_code=422, detail="Select a grade for every completed course.")
+        raise HTTPException(status_code=422, detail=f"Select a grade for every completed course. Missing: {', '.join(missing)}.")
     return grades
 
 

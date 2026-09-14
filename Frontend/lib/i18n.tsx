@@ -136,6 +136,7 @@ const en: Dict = {
   "auth.heroSubtitle": "Understand course difficulty, workload and fit before you choose.",
   "auth.privacyConsent": "I consent to Masar storing and using my information for academic planning and account services.",
   "auth.consentRequired": "Please provide consent before creating your account.",
+  "auth.missingGrades": "Please select a grade for: {courses}",
 
   "level.extreme": "Extreme",
   "level.high": "High",
@@ -340,6 +341,7 @@ const en: Dict = {
   "profile.saved": "Profile saved",
   "profile.savedBody": "Your academic profile, completed courses and preferences have been updated. Masar is refreshing your recommendations in the background.",
   "profile.couldNotSave": "Could not save profile.",
+  "profile.missingGrades": "Please select a grade for: {courses}",
   "profile.chooseImage": "Please choose an image file.",
   "profile.photoTooLarge": "Photo must be smaller than 4 MB.",
   "profile.couldNotProcessPhoto": "Could not process the photo.",
@@ -490,6 +492,7 @@ const ar: Dict = {
   "auth.heroSubtitle": "افهم صعوبة المقرر وعبء العمل ومدى ملاءمته قبل أن تختار.",
   "auth.privacyConsent": "أوافق على تخزين معلوماتي واستخدامها في التخطيط الأكاديمي وخدمات الحساب.",
   "auth.consentRequired": "يرجى تقديم الموافقة قبل إنشاء الحساب.",
+  "auth.missingGrades": "يرجى اختيار تقدير للمقررات التالية: {courses}",
 
   "level.extreme": "شديدة",
   "level.high": "عالية",
@@ -694,6 +697,7 @@ const ar: Dict = {
   "profile.saved": "تم حفظ الملف الشخصي",
   "profile.savedBody": "تم تحديث ملفك الأكاديمي والمقررات المكتملة وتفضيلاتك. يقوم مسار بتحديث توصياتك في الخلفية.",
   "profile.couldNotSave": "تعذر حفظ الملف الشخصي.",
+  "profile.missingGrades": "يرجى اختيار تقدير للمقررات التالية: {courses}",
   "profile.chooseImage": "يرجى اختيار ملف صورة.",
   "profile.photoTooLarge": "يجب أن يكون حجم الصورة أقل من 4 ميغابايت.",
   "profile.couldNotProcessPhoto": "تعذرت معالجة الصورة.",
