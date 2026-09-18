@@ -24,6 +24,7 @@ def _send_via_resend(to_email: str, subject: str, body: str) -> bool:
     api_key = os.getenv("RESEND_API_KEY")
     from_email = os.getenv("RESEND_FROM", "Masar <no-reply@masar.app>")
     if not api_key:
+        print("[email_utils] RESEND_API_KEY is not set in .env")
         return False
     try:
         response = requests.post(
@@ -37,7 +38,14 @@ def _send_via_resend(to_email: str, subject: str, body: str) -> bool:
             },
             timeout=10,
         )
-        return response.status_code < 300
+        if response.status_code >= 300:
+            # This is the important bit for debugging: Resend's error body
+            # explains exactly why the send was rejected (e.g. "domain is
+            # not verified", "You can only send testing emails to your own
+            # email address" for sandbox accounts, invalid `from` format...).
+            print(f"[email_utils] Resend rejected the email ({response.status_code}): {response.text}")
+            return False
+        return True
     except Exception as exc:                    
         print(f"[email_utils] Resend send failed: {exc}")
         return False
@@ -76,20 +84,44 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
     if provider == "resend":
         if _send_via_resend(to_email, subject, body):
             return True
+        print("[email_utils] Resend send FAILED (see error above) - falling back to console log below. "
+              "The OTP is printed, but the person will not receive a real email until this is fixed.")
     elif provider == "smtp":
         if _send_via_smtp(to_email, subject, body):
             return True
+        print("[email_utils] SMTP send FAILED (see error above) - falling back to console log below.")
+    else:
+        print(f"[email_utils] EMAIL_PROVIDER is not set to 'resend' or 'smtp' (currently: {provider!r}) - "
+              "no real email will be sent, only logged below.")
 
-                                                                            
-                                                   
-    print(f"[email_utils] (DEV MODE - not actually sent) To: {to_email}\nSubject: {subject}\n{body}")
+    print(f"[email_utils] (NOT SENT) To: {to_email}\nSubject: {subject}\n{body}")
     return True
 
 
-def send_otp_email(to_email: str, otp_code: str) -> bool:
-    subject = "Masar - Password Reset Code"
+def send_otp_email(to_email: str, otp_code: str, purpose: str = "reset") -> bool:
+    """purpose: 'signup' | 'login' | 'reset' -- controls the subject/body so
+    the email correctly reflects why the code was sent."""
+    copy = {
+        "signup": {
+            "subject": "Masar - Verify Your Account",
+            "intro": "Your Masar account verification code is:",
+        },
+        "login": {
+            "subject": "Masar - Login Verification Code",
+            "intro": "Your Masar login verification code is:",
+        },
+        "reset": {
+            "subject": "Masar - Password Reset Code",
+            "intro": "Your Masar password reset code is:",
+        },
+    }.get(purpose, {
+        "subject": "Masar - Verification Code",
+        "intro": "Your Masar verification code is:",
+    })
+
+    subject = copy["subject"]
     body = (
-        f"Your Masar password reset code is: {otp_code}\n\n"
+        f"{copy['intro']} {otp_code}\n\n"
         "This code expires in 10 minutes. If you did not request this, "
         "you can safely ignore this email."
     )

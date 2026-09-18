@@ -244,7 +244,7 @@ def _validate_completed_grades(course_codes: List[str], grades: dict[str, str] |
         raise HTTPException(status_code=422, detail="Only passing grades A+ through D are allowed for completed courses.")
     missing = [code for code in course_codes if normalize_course_code(code) not in grades]
     if missing:
-        raise HTTPException(status_code=422, detail=f"Select a grade for every completed course. Missing: {', '.join(missing)}.")
+        raise HTTPException(status_code=422, detail="Select a grade for every completed course.")
     return grades
 
 
@@ -455,7 +455,7 @@ def login(payload: LoginRequest):
                 """),
                 {"sid": row["student_id"], "identifier": row["student_id"], "otp_hash": _hash_otp(otp_code)},
             )
-            send_otp_email(email, otp_code)
+            send_otp_email(email, otp_code, purpose="login")
 
         return {"success": True, "otp_required": True, "student_id": row["student_id"], "message": "A verification code has been sent to your registered email."}
     except HTTPException:
@@ -546,7 +546,7 @@ def signup_request_otp(profile: SignupOtpRequest):
             """),
             {"identifier": email, "otp_hash": _hash_otp(otp_code), "payload": json.dumps(pending)},
         )
-        send_otp_email(email, otp_code)
+        send_otp_email(email, otp_code, purpose="signup")
 
     return {"success": True, "message": "Verification code sent to your UAEU email."}
 
@@ -641,7 +641,7 @@ def forgot_password(payload: ForgotPasswordRequest):
             ),
             {"sid": row["student_id"], "otp_hash": _hash_otp(otp_code)},
         )
-        send_otp_email(row["email"], otp_code)
+        send_otp_email(row["email"], otp_code, purpose="reset")
 
     return {"success": True, "message": generic_message}
 
