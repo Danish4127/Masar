@@ -329,11 +329,7 @@ function Catalog({courses,selected,setSelected,completed,onModal}:{courses:Cours
     const review= (
       <div>
         <PlanPreview courses={selectedCourses}/>
-        <div className="review-actions">
-          <button className="primary-button" onClick={saveSelected} disabled={savingPlan}>
-            {savingPlan ? <><LoadingDots label={t("catalog.saving")}/> {t("catalog.savingEllipsis")}</> : <><Check size={16}/> {t("catalog.savePlan")}</>}
-          </button>
-        </div>
+        <ReviewPlanActions onSave={saveSelected}/>
       </div>
     );
     onModal(t("catalog.reviewYourPlan"),review);
@@ -397,7 +393,7 @@ function Catalog({courses,selected,setSelected,completed,onModal}:{courses:Cours
       <div className="selection-bar">
         <div><strong>{selected.length}</strong> {t("catalog.coursesSelected")}</div>
         <div><strong>{selectedCredits}</strong> {t("catalog.credits")}</div>
-        <button className="primary-button" disabled={!selected.length || savingPlan} onClick={openReview}>
+        <button className="primary-button" disabled={!selected.length || savingPlan || saved} onClick={openReview}>
           {saved ? <><Check size={16}/> {t("catalog.planSaved")}</> : <>{t("catalog.reviewSelectedPlan")} <ArrowRight size={16}/></>}
         </button>
       </div>
@@ -405,6 +401,29 @@ function Catalog({courses,selected,setSelected,completed,onModal}:{courses:Cours
   );
 }
 function PlanPreview({courses}:{courses:Course[]}){const {t}=useLanguage();return <div><p className="modal-lead">{t("catalog.manualSelectionReady")}</p>{courses.length?courses.map(c=><div className="preview-row" key={c.course_code}><span>{c.course_code}</span><b>{c.course_name}</b><em>{c.credits} {t("course.credits")}</em></div>):<p>{t("catalog.noCoursesSelectedYet")}</p>}</div>}
+
+// The review modal's body is created once (inside openReview) and handed to a parent-level
+// modal state that only changes when a *new* onModal(...) call replaces it. A plain button
+// reading Catalog's `savingPlan` closes over that value at creation time, so it never reflects
+// later state changes and can be clicked repeatedly while the request is in flight. Giving the
+// button its own mounted component with its own state fixes that: React keeps this component
+// instance alive and re-renders it independently whenever its own "saving" state changes.
+function ReviewPlanActions({onSave}:{onSave:()=>Promise<void>}) {
+  const {t} = useLanguage();
+  const [saving,setSaving] = useState(false);
+  const click = async () => {
+    if (saving) return;
+    setSaving(true);
+    try { await onSave(); } finally { setSaving(false); }
+  };
+  return (
+    <div className="review-actions">
+      <button className="primary-button" onClick={click} disabled={saving}>
+        {saving ? <><LoadingDots label={t("catalog.saving")}/> {t("catalog.savingEllipsis")}</> : <><Check size={16}/> {t("catalog.savePlan")}</>}
+      </button>
+    </div>
+  );
+}
 
 function ProgressPage({student,completed,grades,courses,onNavigate,history,onModal}:{student:Student;completed:string[];grades:Record<string,string>;courses:Course[];onNavigate:(v:View)=>void;history:HistoryItem[];onModal:(t:string,b:React.ReactNode)=>void}) {
   const {t} = useLanguage();
