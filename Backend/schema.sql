@@ -98,3 +98,12 @@ CREATE TABLE IF NOT EXISTS course_ratings (
     UNIQUE(student_id, course_id)
 );
 CREATE INDEX IF NOT EXISTS idx_course_ratings_course ON course_ratings(course_id);
+
+CREATE TABLE IF NOT EXISTS ai_explanation_cache (
+    cache_key VARCHAR(64) PRIMARY KEY,
+    course_code VARCHAR(20) NOT NULL,
+    model VARCHAR(100) NOT NULL,
+    explanation TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ai_explanation_cache_course ON ai_explanation_cache(course_code);

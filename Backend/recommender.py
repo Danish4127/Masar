@@ -4,13 +4,33 @@ The engine keeps the project's rule-based approach but builds three genuinely
 separate semester options.  Each option has a different credit target,
 workload budget and difficulty allowance, while prerequisite and completed-
 course checks remain hard constraints.
+
+AI explanation layer: the recommendation DECISION (which courses are
+eligible, which get selected, why others are excluded) is made entirely by
+the deterministic rule engine below. The only thing that can optionally be
+AI-generated is the *phrasing* of the "why this course" text for courses that
+were already selected. That is handled by ai_explanation.py (one batched LLM
+call per plan, output validated, results cached in ai_explanation_cache).
+If the AI is disabled, has no key, times out, fails validation or errors,
+the deterministic template sentence from generate_course_reason() is kept,
+so recommendations always work.
 """
 
+import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
 from sqlalchemy import text
+from ai_explanation import generate_ai_explanations
 from db import engine
+
+logger = logging.getLogger("masar.ai_explanations")
+if not logging.getLogger().handlers:
+    # Only configure if nothing else (e.g. uvicorn) already has - keeps
+    # this a no-op if the app already sets up logging elsewhere.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
 HIGH_DIFFICULTY_THRESHOLD = 4
 HIGH_MATH_THRESHOLD = 4
@@ -94,6 +114,56 @@ def generate_exclusion_reason(reason_code: str, extra: str = "") -> str:
         "workload_limit": "Not selected because adding it would exceed this plan's workload budget.",
     }
     return messages.get(reason_code, "Not included in this plan.")
+
+
+# --- AI explanation layer ---------------------------------------------------
+# See module docstring: this only rewrites the deterministic reason text into
+# more natural prose (via ai_explanation.py). It never influences which courses
+# are selected or excluded - that decision was already made above this point.
+
+def _build_explanation_facts(course: dict, student_data: dict, rank: int, total_eligible: int) -> dict:
+    """The exact, ground-truth facts the AI is allowed to talk about.
+    Every field is a value already computed/held by the rule engine; the AI
+    only receives these numbers and is validated against them afterwards.
+    No student identity (id, name, email) is ever included."""
+    return {
+        "course_name": str(course["course_name"]),
+        "credits": int(course["credits"]),
+        "difficulty_level": int(course["difficulty_level"]),
+        "math_intensity": int(course["math_intensity"]),
+        "weekly_workload": int(course["weekly_workload"]),
+        "has_programming": str(course.get("has_programming", "No")),
+        "student_gpa": round(float(student_data.get("gpa", 3.0)), 2),
+        "student_math_confidence": float(student_data.get("math_confidence", 3)),
+        "student_programming_confidence": float(student_data.get("programming_confidence", 3)),
+        "student_workload_tolerance": float(student_data.get("workload_tolerance", DEFAULT_WORKLOAD_TOLERANCE)),
+        "fit_rank": f"#{rank} of {total_eligible} eligible courses in this plan, ranked by fit",
+    }
+
+
+def _attach_ai_explanations(included: list, student_data: dict, plan_label: str, total_eligible: int, rank_map: dict):
+    """Replace each included course's deterministic `reason` with a validated,
+    AI-written one when available. One batched call covers the whole plan.
+    Any failure leaves the deterministic reason untouched."""
+    if not included:
+        return
+    try:
+        course_facts = [
+            {
+                "course_code": str(item["course_code"]).strip(),
+                "facts": _build_explanation_facts(item, student_data, rank_map.get(item["course_id"], 0), total_eligible),
+            }
+            for item in included
+        ]
+        explanations = generate_ai_explanations(course_facts)
+    except Exception as exc:  # the AI layer must never break a recommendation
+        logger.warning("AI explanation layer failed for the %s plan (%s: %s) - using deterministic reasons.",
+                       plan_label, type(exc).__name__, exc)
+        return
+    for item in included:
+        explanation = explanations.get(str(item["course_code"]).strip())
+        if explanation:
+            item["reason"] = explanation
 
 
 def _fit_score(course, student_data) -> float:
@@ -250,6 +320,19 @@ def generate_recommendations(
             item["reason"] = generate_course_reason(course, student_data)
             included.append(item)
 
+    if included:
+        # Rank each selected course by fit score among all eligible courses
+        # (not just the selected ones) - this is what the AI prompt calls
+        # "fit_rank", e.g. "#1 of 9 eligible courses". Purely informational;
+        # does not change which courses were selected above.
+        eligible_scores = {
+            int(row["course_id"]): _fit_score(row, student_data)
+            for _, row in eligible_df.iterrows()
+        }
+        ordered = sorted(eligible_scores.items(), key=lambda kv: kv[1], reverse=True)
+        rank_map = {course_id: i + 1 for i, (course_id, _) in enumerate(ordered)}
+        _attach_ai_explanations(included, student_data, plan_label, len(eligible_df), rank_map)
+
     recommendations_df = pd.DataFrame(included)
     if not recommendations_df.empty:
         recommendations_df = recommendations_df.sort_values(["difficulty_level", "course_code"], ascending=[True, True]).reset_index(drop=True)
@@ -281,36 +364,52 @@ def generate_recommendations(
     return recommendations_df, excluded, message
 
 
+def _generate_one_plan(name: str, cfg: dict, student_data: dict, completed_course_codes: list[str]) -> tuple:
+    plan_data = dict(student_data)
+    tolerance = float(student_data.get("workload_tolerance", DEFAULT_WORKLOAD_TOLERANCE))
+    plan_data["plan_workload_target"] = {
+        "safer": max(18.0, tolerance * 0.70),
+        "balanced": max(24.0, tolerance * 0.95),
+        "advanced": max(30.0, tolerance * 1.20),
+    }[name]
+    recs_df, excluded, message = generate_recommendations(
+        plan_data,
+        completed_course_codes,
+        credit_target_max=cfg["credit_target_max"],
+        max_high_difficulty=cfg["max_high_difficulty"],
+        workload_multiplier=cfg["workload_multiplier"],
+        plan_label=name.capitalize(),
+    )
+    total_credits = int(recs_df["credits"].sum()) if not recs_df.empty else 0
+    total_workload = int(recs_df["weekly_workload"].sum()) if not recs_df.empty else 0
+    risk_level = "Low" if name == "safer" else ("Medium" if name == "balanced" else "High")
+    return name, {
+        "recommendations": recs_df.to_dict(orient="records"),
+        "excluded": excluded,
+        "message": message,
+        "total_credits": total_credits,
+        "target_credits": cfg["target_credits"],
+        "total_workload": total_workload,
+        "risk_level": risk_level,
+    }
+
+
 def generate_all_plans(student_data: dict, completed_course_codes: list[str]) -> dict:
+    # Each plan's own AI-explanation batch is already parallelized internally
+    # (see _attach_ai_explanations). Without this outer pool, the 3 plans ran
+    # one after another, so page-load latency was ~3x a single AI call's
+    # duration (this is what caused ~15s loads once AI was turned on, vs
+    # <5s with it off). Running the 3 plans themselves concurrently brings
+    # total latency back down to roughly one plan's worth of AI time.
     results = {}
-    for name, cfg in PLAN_VARIANTS.items():
-        plan_data = dict(student_data)
-        tolerance = float(student_data.get("workload_tolerance", DEFAULT_WORKLOAD_TOLERANCE))
-        plan_data["plan_workload_target"] = {
-            "safer": max(18.0, tolerance * 0.70),
-            "balanced": max(24.0, tolerance * 0.95),
-            "advanced": max(30.0, tolerance * 1.20),
-        }[name]
-        recs_df, excluded, message = generate_recommendations(
-            plan_data,
-            completed_course_codes,
-            credit_target_max=cfg["credit_target_max"],
-            max_high_difficulty=cfg["max_high_difficulty"],
-            workload_multiplier=cfg["workload_multiplier"],
-            plan_label=name.capitalize(),
-        )
-        total_credits = int(recs_df["credits"].sum()) if not recs_df.empty else 0
-        total_workload = int(recs_df["weekly_workload"].sum()) if not recs_df.empty else 0
-        risk_level = "Low" if name == "safer" else ("Medium" if name == "balanced" else "High")
-        results[name] = {
-            "recommendations": recs_df.to_dict(orient="records"),
-            "excluded": excluded,
-            "message": message,
-            "total_credits": total_credits,
-            "target_credits": cfg["target_credits"],
-            "total_workload": total_workload,
-            "risk_level": risk_level,
-        }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_generate_one_plan, name, cfg, student_data, completed_course_codes)
+            for name, cfg in PLAN_VARIANTS.items()
+        ]
+        for future in futures:
+            name, plan_result = future.result()
+            results[name] = plan_result
     return results
 
 
