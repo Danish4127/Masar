@@ -33,7 +33,7 @@ def new_student(api, db):
         sid = str(next(counter))
         body = {"student_id": sid, "full_name": "Test Student", "academic_major": "Information Security", "gpa": 3.2,
                 "math_confidence": 3, "programming_confidence": 4, "workload_tolerance": 30, "email": f"t{sid}@uaeu.ac.ae",
-                "password": "Sup3rSecret!", "completed_courses": ["MATH105"], "completed_grades": {"MATH105": "B"},
+                "password": "TestPassword123!", "completed_courses": ["MATH105"], "completed_grades": {"MATH105": "B"},
                 "privacy_consent": True}
         body.update(overrides)
         api.sent.clear()
@@ -61,15 +61,15 @@ def test_signup_flow_returns_plans_and_valid_json(new_student):
 
 def test_direct_signup_is_disabled(api):
     r = api.post("/students/signup", json={"student_id": "200009991", "full_name": "X", "gpa": 3, "math_confidence": 3, "programming_confidence": 3,
-                                           "workload_tolerance": 30, "email": "x9991@uaeu.ac.ae", "password": "Sup3rSecret!", "privacy_consent": True})
+                                           "workload_tolerance": 30, "email": "x9991@uaeu.ac.ae", "password": "TestPassword123!", "privacy_consent": True})
     assert r.status_code == 403
 
 def test_password_policy_and_domain(api):
     base = {"student_id": "200009992", "full_name": "X", "gpa": 3, "math_confidence": 3, "programming_confidence": 3,
             "workload_tolerance": 30, "email": "x9992@uaeu.ac.ae", "privacy_consent": True}
     assert api.post("/students/signup/request-otp", json={**base, "password": "short7!"}).status_code == 400
-    assert api.post("/students/signup/request-otp", json={**base, "password": "Sup3rSecret!", "email": "x@gmail.com"}).status_code == 400
-    assert api.post("/students/signup/request-otp", json={**base, "password": "Sup3rSecret!", "privacy_consent": False}).status_code == 400
+    assert api.post("/students/signup/request-otp", json={**base, "password": "TestPassword123!", "email": "x@gmail.com"}).status_code == 400
+    assert api.post("/students/signup/request-otp", json={**base, "password": "TestPassword123!", "privacy_consent": False}).status_code == 400
 
 def test_forged_token_with_old_default_secret_is_rejected(api, new_student):
     body, _ = new_student()
