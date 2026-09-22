@@ -1,4 +1,4 @@
-"""AI explanation layer (optional).
+"""AI explanation layer (Additional Feature)
 
 The rule engine in recommender.py decides WHICH courses are recommended. This
 module only rewrites the supplied facts into friendly prose. It is designed to
