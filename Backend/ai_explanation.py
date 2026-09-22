@@ -1,3 +1,28 @@
+"""AI explanation layer (optional).
+
+The rule engine in recommender.py decides WHICH courses are recommended. This
+module only rewrites the supplied facts into friendly prose. It is designed to
+be robust against slow / rate-limited providers (e.g. Groq free tier):
+
+* ONE request explains ALL courses of a page load (not one request per course),
+  so a page load costs a single provider call instead of 12-18.
+* Explanations are cached in memory and in PostgreSQL (ai_explanation_cache),
+  so the same student/course facts never call the provider twice
+  (keeps NFR 3.3 - identical input, identical output - true).
+* HTTP 429 / 5xx / timeouts are retried with back-off (honouring Retry-After)
+  inside an overall time budget.
+* A circuit breaker pauses AI calls for a while after repeated failures, so a
+  broken provider never slows every page load.
+* Every explanation is validated (no invented numbers, no personal data).
+  Anything missing or invalid falls back to the deterministic sentence.
+
+Environment variables (all optional):
+  AI_EXPLANATION_ENABLED            true/false (default false)
+  AI_API_KEY, AI_API_BASE, AI_MODEL provider settings (OpenAI-compatible)
+  AI_EXPLANATION_TIMEOUT_SECONDS    per-request timeout, minimum 5 (default 12)
+  AI_EXPLANATION_MAX_RETRIES        default 2
+  AI_EXPLANATION_BUDGET_SECONDS     total time budget per batch (default 25)
+"""
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +31,8 @@ import logging
 import os
 import re
 import threading
+import time
+from collections import OrderedDict
 from typing import Any
 
 import requests
@@ -13,655 +40,331 @@ from sqlalchemy import bindparam, text
 
 from db import engine
 
+logger = logging.getLogger("masar.ai_explanations")
 
-logger = logging.getLogger("masar.ai_explanation")
-
-AI_EXPLANATION_CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
-DEFAULT_AI_API_BASE = "https://api.groq.com/openai/v1"
-DEFAULT_TIMEOUT_SECONDS = 2.5
+DEFAULT_API_BASE = "https://api.groq.com/openai/v1"
+MIN_TIMEOUT_SECONDS = 5.0
 
+_MEM_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_MEM_LOCK = threading.Lock()
+_MEM_MAX = 4000
+_PROVIDER_SLOTS = threading.BoundedSemaphore(2)
+_cooldown_until = 0.0
+_table_ready = False
+_table_lock = threading.Lock()
+_warned_timeout = False
 
-def _build_prompt(course_items: list[dict[str, Any]]) -> tuple[str, str]:
-    system_prompt = """
-You are the natural-language explanation layer for an academic course
-recommendation system.
+last_status: dict = {"ok": None, "detail": "not called yet", "at": None}
 
-The recommendation engine has already decided which courses are recommended.
-Your job is ONLY to turn the supplied structured facts into short,
-natural-language explanations.
+                                                                           
+def _cfg() -> dict:
+    def _float(name, default):
+        try:
+            return float(os.getenv(name, "") or default)
+        except ValueError:
+            return float(default)
+
+    global _warned_timeout
+    timeout = _float("AI_EXPLANATION_TIMEOUT_SECONDS", 12)
+    if timeout < MIN_TIMEOUT_SECONDS:
+        if not _warned_timeout:
+            _warned_timeout = True
+            logger.warning("AI_EXPLANATION_TIMEOUT_SECONDS=%.1f is too low for an LLM call; using %.1f.", timeout, MIN_TIMEOUT_SECONDS)
+        timeout = MIN_TIMEOUT_SECONDS
+    return {
+        "enabled": os.getenv("AI_EXPLANATION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+        "key": os.getenv("AI_API_KEY", "").strip(),
+        "base": (os.getenv("AI_API_BASE", DEFAULT_API_BASE).strip() or DEFAULT_API_BASE).rstrip("/"),
+        "model": os.getenv("AI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        "timeout": timeout,
+        "retries": max(0, int(_float("AI_EXPLANATION_MAX_RETRIES", 2))),
+        "budget": max(timeout, _float("AI_EXPLANATION_BUDGET_SECONDS", 25)),
+    }
+
+def is_enabled() -> bool:
+    cfg = _cfg()
+    return bool(cfg["enabled"] and cfg["key"])
+
+def _set_status(ok: bool, detail: str) -> None:
+    last_status.update({"ok": ok, "detail": detail, "at": time.time()})
+
+                                                                           
+SYSTEM_PROMPT = """You are the natural-language explanation layer of an academic course recommendation system.
+The recommendation engine has ALREADY decided which courses are recommended. Only turn the supplied facts into short explanations.
 
 Rules:
-- Do not change, rank, approve, reject, or re-score any recommendation.
-- Use ONLY the supplied facts.
-- Never invent prerequisites, grades, difficulty, workload, skills, goals,
-  benefits, scores, or other student/course information.
-- Never mention student name, student ID, email, password, or other identity
-  information.
-- Do not introduce new numeric values.
-- Do not make GPA or academic-success guarantees.
-- Keep each explanation to 1–2 natural sentences.
-- Explain why the course fits the supplied academic/profile/workload facts.
-- Return ONLY a JSON object.
-- The JSON keys must be the exact course codes supplied by the user.
-- The value for each key must be the explanation string.
-""".strip()
+- Do not change, rank, approve, reject or re-score any recommendation.
+- Use ONLY the supplied facts. Never invent prerequisites, grades, skills, goals, benefits or scores.
+- Never mention a student name, student ID, email or password.
+- Do not introduce numbers that are not in the facts. The rating scale is 1 to 5.
+- Do not promise GPA or academic-success outcomes.
+- Write 1-2 plain, friendly sentences per course, addressed to the student ("you"), simple English.
+- Mention why the course fits the student's GPA, confidence levels or workload facts.
+- If "taken_with" is not empty, mention that it is taken together with those courses.
+- Return ONLY a JSON object whose keys are the exact course codes given and whose values are the explanation strings."""
 
-    user_prompt = json.dumps(
-        {
-            "course_facts": course_items,
-            "output_format": {
-                "COURSE_CODE": "short natural-language explanation"
-            },
-        },
-        ensure_ascii=False,
-    )
+def _build_messages(items: list[dict]) -> list[dict]:
+    user = json.dumps({"course_facts": items, "output_format": {"COURSE_CODE": "short explanation"}}, ensure_ascii=False)
+    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
-    return system_prompt, user_prompt
-
-
+                                                                           
 def _parse_json_object(content: str) -> dict[str, str]:
-    if not isinstance(content, str):
+    if not isinstance(content, str) or not content.strip():
         return {}
-
-    content = content.strip()
-
-    if not content:
-        return {}
-
-    # Remove accidental markdown code fences.
-    content = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        content,
-        flags=re.IGNORECASE,
-    )
+    content = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
     content = re.sub(r"\s*```$", "", content)
-
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        # Try extracting the first JSON object if the model added extra text.
         match = re.search(r"\{.*\}", content, flags=re.DOTALL)
         if not match:
             return {}
-
         try:
             parsed = json.loads(match.group(0))
         except json.JSONDecodeError:
             return {}
-
     if not isinstance(parsed, dict):
         return {}
+    return {str(k).strip(): v.strip() for k, v in parsed.items() if isinstance(v, str) and v.strip()}
 
-    result: dict[str, str] = {}
-
-    for key, value in parsed.items():
-        if not isinstance(key, str):
-            continue
-
-        if not isinstance(value, str):
-            continue
-
-        explanation = value.strip()
-
-        if explanation:
-            result[key.strip()] = explanation
-
-    return result
-
-
-def _allowed_numbers(facts: dict[str, Any]) -> set[str]:
+def _allowed_numbers(facts: Any) -> set[str]:
     allowed: set[str] = set()
 
-    def collect(value: Any) -> None:
+    def collect(value):
         if isinstance(value, bool):
             return
-
         if isinstance(value, (int, float)):
-            allowed.add(str(value))
-            allowed.add(f"{value:g}")
-            return
-
-        if isinstance(value, str):
-            for match in re.findall(r"\d+(?:\.\d+)?", value):
-                allowed.add(match)
-
-        elif isinstance(value, list):
-            for item in value:
-                collect(item)
-
+            allowed.update({str(value), f"{value:g}", f"{value:.1f}", f"{value:.2f}"})
+        elif isinstance(value, str):
+            allowed.update(re.findall(r"\d+(?:\.\d+)?", value))
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                collect(v)
         elif isinstance(value, dict):
-            for item in value.values():
-                collect(item)
+            for v in value.values():
+                collect(v)
 
     collect(facts)
-
     return allowed
 
-
-def _validate_explanation(
-    explanation: str,
-    facts: dict[str, Any],
-) -> bool:
+def _validate(explanation: str, facts: dict) -> bool:
     if not isinstance(explanation, str):
         return False
-
     explanation = explanation.strip()
-
-    if not 40 <= len(explanation) <= 650:
+    if not 25 <= len(explanation) <= 650:
         return False
-
     lowered = explanation.lower()
-
-    forbidden_phrases = (
-        "student id",
-        "student_id",
-        "email",
-        "password",
-    )
-
-    if any(phrase in lowered for phrase in forbidden_phrases):
+    if any(p in lowered for p in ("student id", "student_id", "email", "password")):
         return False
+    allowed = _allowed_numbers(facts)
+    return all(n in allowed for n in re.findall(r"\d+(?:\.\d+)?", explanation))
 
-    explanation_numbers = re.findall(
-        r"\d+(?:\.\d+)?",
-        explanation,
-    )
+def cache_key(course_code: str, facts: dict, model: str) -> str:
+    raw = json.dumps({"v": CACHE_VERSION, "code": course_code, "model": model, "facts": facts},
+                     sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    allowed_numbers = _allowed_numbers(facts)
+                                                                           
+def _mem_get(key: str):
+    with _MEM_LOCK:
+        if key in _MEM_CACHE:
+            _MEM_CACHE.move_to_end(key)
+            return _MEM_CACHE[key]
+    return None
 
-    for number in explanation_numbers:
-        if number not in allowed_numbers:
-            return False
+def _mem_put(key: str, value: str) -> None:
+    with _MEM_LOCK:
+        _MEM_CACHE[key] = value
+        _MEM_CACHE.move_to_end(key)
+        while len(_MEM_CACHE) > _MEM_MAX:
+            _MEM_CACHE.popitem(last=False)
 
-    return True
-
-
-def _cache_key(
-    course_code: str,
-    facts: dict[str, Any],
-    model: str,
-) -> str:
-    payload = {
-        "version": AI_EXPLANATION_CACHE_VERSION,
-        "course_code": course_code,
-        "model": model,
-        "facts": facts,
-    }
-
-    serialized = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
-    )
-
-    return hashlib.sha256(
-        serialized.encode("utf-8")
-    ).hexdigest()
-
-
-_CACHE_TABLE_READY = False
-_CACHE_TABLE_LOCK = threading.Lock()
-
-
-def ensure_ai_explanation_cache_table() -> None:
-    """Create the cache table if schema.sql was never applied. Runs once per
-    process, under a lock, because the three plans are generated in parallel
-    threads and concurrent CREATE TABLE IF NOT EXISTS can race in PostgreSQL."""
-    global _CACHE_TABLE_READY
-    if _CACHE_TABLE_READY:
+def _ensure_table() -> None:
+    global _table_ready
+    if _table_ready:
         return
-    with _CACHE_TABLE_LOCK:
-        if _CACHE_TABLE_READY:
+    with _table_lock:
+        if _table_ready:
             return
-        _create_cache_table()
-        _CACHE_TABLE_READY = True
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS ai_explanation_cache (cache_key VARCHAR(64) PRIMARY KEY, "
+                    "course_code VARCHAR(20) NOT NULL, model VARCHAR(100) NOT NULL, explanation TEXT NOT NULL, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+            _table_ready = True
+        except Exception as exc:                                           
+            logger.warning("Could not ensure ai_explanation_cache table: %s", exc)
 
-
-def _create_cache_table() -> None:
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS ai_explanation_cache (
-                    cache_key VARCHAR(64) PRIMARY KEY,
-                    course_code VARCHAR(20) NOT NULL,
-                    model VARCHAR(100) NOT NULL,
-                    explanation TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-        )
-
-        connection.execute(
-            text(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_ai_explanation_cache_course
-                ON ai_explanation_cache(course_code)
-                """
-            )
-        )
-
-
-def _get_cached_explanations(
-    cache_entries: list[tuple[str, str]],
-) -> dict[str, str]:
-    if not cache_entries:
+def _db_get(keys: list[str]) -> dict[str, str]:
+    if not keys:
+        return {}
+    _ensure_table()
+    try:
+        stmt = text("SELECT cache_key, explanation FROM ai_explanation_cache WHERE cache_key IN :k").bindparams(bindparam("k", expanding=True))
+        with engine.connect() as conn:
+            return {r[0]: r[1] for r in conn.execute(stmt, {"k": keys}).fetchall()}
+    except Exception as exc:
+        logger.warning("AI cache read failed: %s", exc)
         return {}
 
-    cache_keys = [item[0] for item in cache_entries]
-
-    statement = text(
-        """
-        SELECT cache_key, explanation
-        FROM ai_explanation_cache
-        WHERE cache_key IN :cache_keys
-        """
-    ).bindparams(
-        bindparam("cache_keys", expanding=True)
-    )
-
-    with engine.begin() as connection:
-        rows = connection.execute(
-            statement,
-            {"cache_keys": cache_keys},
-        ).mappings().all()
-
-    key_to_course = {
-        cache_key: course_code
-        for cache_key, course_code in cache_entries
-    }
-
-    result: dict[str, str] = {}
-
-    for row in rows:
-        cache_key = row["cache_key"]
-        explanation = row["explanation"]
-
-        course_code = key_to_course.get(cache_key)
-
-        if course_code and isinstance(explanation, str):
-            result[course_code] = explanation
-
-    return result
-
-
-def _save_cached_explanations(
-    items: list[dict[str, Any]],
-    explanations: dict[str, str],
-    model: str,
-) -> None:
-    if not explanations:
-        return
-
-    rows: list[dict[str, Any]] = []
-
-    for item in items:
-        course_code = str(
-            item.get("course_code", "")
-        ).strip()
-
-        if not course_code:
-            continue
-
-        explanation = explanations.get(course_code)
-
-        if not explanation:
-            continue
-
-        facts = item.get("facts", {})
-
-        rows.append(
-            {
-                "cache_key": _cache_key(
-                    course_code,
-                    facts,
-                    model,
-                ),
-                "course_code": course_code,
-                "model": model,
-                "explanation": explanation,
-            }
-        )
-
+def _db_put(rows: list[dict]) -> None:
     if not rows:
         return
+    _ensure_table()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO ai_explanation_cache (cache_key, course_code, model, explanation) "
+                "VALUES (:cache_key, :course_code, :model, :explanation) "
+                "ON CONFLICT (cache_key) DO UPDATE SET explanation = EXCLUDED.explanation, model = EXCLUDED.model"), rows)
+    except Exception as exc:
+        logger.warning("AI cache write failed: %s", exc)
 
-    with engine.begin() as connection:
-        for row in rows:
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO ai_explanation_cache
-                        (cache_key, course_code, model, explanation)
-                    VALUES
-                        (:cache_key, :course_code, :model, :explanation)
-                    ON CONFLICT (cache_key)
-                    DO UPDATE SET
-                        explanation = EXCLUDED.explanation,
-                        model = EXCLUDED.model
-                    """
-                ),
-                row,
-            )
+                                                                          
+class _ProviderError(Exception):
+    def __init__(self, message, fatal=False):
+        super().__init__(message)
+        self.fatal = fatal
 
+def _retry_after(resp) -> float | None:
+    try:
+        return float(resp.headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return None
 
-def _call_ai(
-    course_items: list[dict[str, Any]],
-    api_key: str,
-    model: str,
-    api_base: str,
-    timeout: float,
-) -> dict[str, str]:
-    system_prompt, user_prompt = _build_prompt(course_items)
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+def _call_provider(items: list[dict], cfg: dict) -> dict[str, str]:
+    """One chat-completions request (with retries) returning {course_code: text}."""
+    payload: dict = {
+        "model": cfg["model"],
+        "messages": _build_messages(items),
         "temperature": 0.2,
-        # Reasoning models (e.g. gpt-oss) spend part of this budget on hidden
-        # "thinking" tokens; a small budget can yield an EMPTY answer.
-        "max_completion_tokens": 1000,
+
+        "max_completion_tokens": min(4000, 300 * len(items) + 1200),
         "response_format": {"type": "json_object"},
     }
-    if "gpt-oss" in model:
+    if "gpt-oss" in cfg["model"]:
         payload["reasoning_effort"] = "low"
+    headers = {"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"}
+    deadline = time.monotonic() + cfg["budget"]
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 1.5:
+            raise _ProviderError("time budget exhausted")
+        try:
+            with _PROVIDER_SLOTS:
+                resp = requests.post(f"{cfg['base']}/chat/completions", headers=headers, json=payload,
+                                     timeout=(min(5.0, remaining), min(cfg["timeout"], remaining)))
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt >= cfg["retries"]:
+                raise _ProviderError(f"{type(exc).__name__}") from exc
+            attempt += 1
+            time.sleep(min(1.5 * 2 ** (attempt - 1), 4, max(0, deadline - time.monotonic() - 1)))
+            continue
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    url = f"{api_base}/chat/completions"
+        if resp.status_code == 400 and "response_format" in payload and "response_format" in resp.text.lower():
+            payload.pop("response_format")                                    
+            continue
+        if resp.status_code in (401, 403):
+            raise _ProviderError(f"HTTP {resp.status_code} (check AI_API_KEY / model access)", fatal=True)
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if attempt >= cfg["retries"]:
+                raise _ProviderError(f"HTTP {resp.status_code} after {attempt + 1} attempt(s)")
+            wait = _retry_after(resp)
+            wait = min(wait if wait is not None else 1.5 * 2 ** attempt, 6.0)
+            attempt += 1
+            logger.info("AI provider returned %s - retrying in %.1fs (attempt %d)", resp.status_code, wait, attempt)
+            time.sleep(min(wait, max(0.0, deadline - time.monotonic() - 1)))
+            continue
+        if resp.status_code >= 400:
+            raise _ProviderError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            choice = (resp.json().get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+        except ValueError as exc:
+            raise _ProviderError("invalid JSON from provider") from exc
+        result = _parse_json_object(content)
+        if not result:
+            raise _ProviderError(f"empty/unparseable answer (finish_reason={choice.get('finish_reason')})")
+        return result
 
-    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    if response.status_code == 400 and "response_format" in payload:
-        # Some providers/models do not support JSON mode. The parser below
-        # already copes with fenced / chatty JSON, so retry once without it.
-        logger.info("AI provider rejected response_format (HTTP 400); retrying without it.")
-        payload.pop("response_format")
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-
-    response.raise_for_status()
-
-    payload = response.json() or {}
-
-    choices = payload.get("choices", [])
-
-    if not choices:
-        return {}
-
-    message = choices[0].get("message", {})
-
-    if not isinstance(message, dict):
-        return {}
-
-    content = message.get("content", "")
-
-    if not isinstance(content, str):
-        return {}
-
-    return _parse_json_object(content)
-
-
-def generate_ai_explanations(
-    course_facts: list[dict[str, Any]],
-) -> dict[str, str]:
-    """
-    Generate natural-language explanations for already-selected courses.
-
-    The deterministic recommendation engine remains the source of truth.
-    This function only converts structured recommendation facts into prose.
-
-    Expected input:
-
-    [
-        {
-            "course_code": "MATH105",
-            "facts": {
-                ...
-            }
-        }
-    ]
-
-    Returns:
-
-    {
-        "MATH105": "This course fits ..."
-    }
-    """
-
+                                                                            
+def generate_ai_explanations(course_facts: list[dict]) -> dict[str, str]:
+    """course_facts: [{"course_code": "MATH105", "facts": {...}}, ...].
+    Returns {course_code: explanation} for every course that could be
+    explained. Missing courses simply keep their deterministic text."""
+    global _cooldown_until
     if not course_facts:
         return {}
-
-    enabled = os.getenv(
-        "AI_EXPLANATION_ENABLED",
-        "false",
-    ).strip().lower()
-
-    if enabled not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    cfg = _cfg()
+    if not (cfg["enabled"] and cfg["key"]):
         return {}
 
-    api_key = os.getenv(
-        "AI_API_KEY",
-        "",
-    ).strip()
-
-    if not api_key:
-        logger.warning(
-            "AI_EXPLANATION_ENABLED=true but AI_API_KEY is empty - "
-            "using deterministic explanations."
-        )
-        return {}
-
-    model = os.getenv(
-        "AI_MODEL",
-        DEFAULT_MODEL,
-    ).strip() or DEFAULT_MODEL
-
-    api_base = os.getenv(
-        "AI_API_BASE",
-        DEFAULT_AI_API_BASE,
-    ).strip().rstrip("/")
-
-    try:
-        timeout = float(
-            os.getenv("AI_EXPLANATION_TIMEOUT_SECONDS")
-            or os.getenv("AI_TIMEOUT_SECONDS")
-            or DEFAULT_TIMEOUT_SECONDS
-        )
-    except (TypeError, ValueError):
-        timeout = DEFAULT_TIMEOUT_SECONDS
-
-    if timeout <= 0:
-        timeout = DEFAULT_TIMEOUT_SECONDS
-
-    try:
-        ensure_ai_explanation_cache_table()
-    except Exception as exc:
-        logger.warning(
-            "Could not ensure ai_explanation_cache table (%s: %s) - "
-            "using deterministic explanations.",
-            type(exc).__name__,
-            exc,
-        )
-        return {}
-
-    cache_entries: list[tuple[str, str]] = []
-    missing_items: list[dict[str, Any]] = []
-
+    unique: dict[str, dict] = {}
     for item in course_facts:
-        course_code = str(
-            item.get("course_code", "")
-        ).strip()
+        code = str(item.get("course_code", "")).strip()
+        facts = item.get("facts")
+        if code and isinstance(facts, dict) and code not in unique:
+            unique[code] = facts
+    keys = {code: cache_key(code, facts, cfg["model"]) for code, facts in unique.items()}
 
-        facts = item.get("facts", {})
-
-        if not course_code or not isinstance(facts, dict):
-            continue
-
-        cache_entries.append(
-            (
-                _cache_key(
-                    course_code,
-                    facts,
-                    model,
-                ),
-                course_code,
-            )
-        )
-
-    try:
-        cached = _get_cached_explanations(
-            cache_entries
-        )
-    except Exception as exc:
-        logger.warning(
-            "AI explanation cache read failed (%s: %s) - continuing without cache.",
-            type(exc).__name__,
-            exc,
-        )
-        cached = {}
-
-    cached_codes = set(cached.keys())
-
-    for item in course_facts:
-        course_code = str(
-            item.get("course_code", "")
-        ).strip()
-
-        if not course_code:
-            continue
-
-        if course_code in cached_codes:
-            continue
-
-        facts = item.get("facts", {})
-
-        if not isinstance(facts, dict):
-            continue
-
-        missing_items.append(
-            {
-                "course_code": course_code,
-                "facts": facts,
-            }
-        )
-
-    if not missing_items:
-        return cached
-
-    try:
-        generated = _call_ai(
-            missing_items,
-            api_key,
-            model,
-            api_base,
-            timeout,
-        )
-    except requests.exceptions.Timeout:
-        logger.warning(
-            "AI explanation call timed out after %.1fs - using deterministic text.",
-            timeout,
-        )
-        return cached
-    except requests.exceptions.HTTPError as exc:
-        # Usually a wrong key, wrong model name or wrong AI_API_BASE; the
-        # response body normally says exactly why.
-        body = ""
-        try:
-            body = exc.response.text[:300]
-        except Exception:
-            pass
-        logger.warning(
-            "AI explanation call failed with HTTP %s: %s - using deterministic text.",
-            getattr(exc.response, "status_code", "?"),
-            body,
-        )
-        return cached
-    except Exception as exc:
-        # AI is an enhancement layer. If it fails, the deterministic
-        # recommender will continue using its normal fallback reason.
-        logger.warning(
-            "AI explanation call failed (%s: %s) - using deterministic text.",
-            type(exc).__name__,
-            exc,
-        )
-        return cached
-
-    if not generated:
-        logger.warning(
-            "AI explanation response was empty or not valid JSON - using deterministic text."
-        )
-
-    validated: dict[str, str] = {}
-
-    facts_by_code = {
-        str(item["course_code"]).strip(): item.get(
-            "facts",
-            {},
-        )
-        for item in missing_items
-    }
-
-    for course_code, explanation in generated.items():
-        normalized_code = str(
-            course_code
-        ).strip()
-
-        facts = facts_by_code.get(
-            normalized_code
-        )
-
-        if not isinstance(facts, dict):
-            continue
-
-        if _validate_explanation(
-            explanation,
-            facts,
-        ):
-            validated[
-                normalized_code
-            ] = explanation.strip()
+    result: dict[str, str] = {}
+    need_db = []
+    for code, key in keys.items():
+        hit = _mem_get(key)
+        if hit:
+            result[code] = hit
         else:
-            logger.info(
-                "AI explanation for %s rejected by validation - using deterministic text.",
-                normalized_code,
-            )
+            need_db.append(code)
+    if need_db:
+        db_hits = _db_get([keys[c] for c in need_db])
+        for code in need_db:
+            text_ = db_hits.get(keys[code])
+            if text_:
+                result[code] = text_
+                _mem_put(keys[code], text_)
+    missing = [c for c in unique if c not in result]
+    if not missing:
+        return result
 
-    if validated:
-        logger.info(
-            "AI explanations generated for %d/%d course(s) (model=%s).",
-            len(validated),
-            len(missing_items),
-            model,
-        )
-        try:
-            _save_cached_explanations(
-                missing_items,
-                validated,
-                model,
-            )
-        except Exception as exc:
-            logger.warning(
-                "AI explanation cache write failed (%s: %s) - explanations still returned.",
-                type(exc).__name__,
-                exc,
-            )
+    if time.monotonic() < _cooldown_until:
+        return result                                                                   
 
-    result = dict(cached)
-    result.update(validated)
+    items = [{"course_code": c, "facts": unique[c]} for c in missing]
+    try:
+        generated = _call_provider(items, cfg)
+    except _ProviderError as exc:
+        _cooldown_until = time.monotonic() + (300 if exc.fatal else 45)
+        _set_status(False, str(exc))
+        logger.warning("AI explanations unavailable (%s) - using deterministic text.", exc)
+        return result
+    except Exception as exc:                                                 
+        _cooldown_until = time.monotonic() + 45
+        _set_status(False, f"{type(exc).__name__}: {exc}")
+        logger.warning("AI explanation call failed unexpectedly: %s", exc)
+        return result
 
+    rows = []
+    rejected = 0
+    for code in missing:
+        candidate = generated.get(code)
+        if candidate and _validate(candidate, unique[code]):
+            result[code] = candidate
+            _mem_put(keys[code], candidate)
+            rows.append({"cache_key": keys[code], "course_code": code, "model": cfg["model"], "explanation": candidate})
+        else:
+            rejected += 1
+    _db_put(rows)
+    _set_status(True, f"{len(rows)} generated, {rejected} rejected/missing")
+    if rejected:
+        logger.info("AI explanations: %d valid, %d rejected or missing (deterministic text used for those).", len(rows), rejected)
     return result
+
+def reset_state_for_tests() -> None:
+    global _cooldown_until, _table_ready
+    _cooldown_until = 0.0
+    with _MEM_LOCK:
+        _MEM_CACHE.clear()

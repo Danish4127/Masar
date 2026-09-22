@@ -12,6 +12,13 @@ CREATE TABLE IF NOT EXISTS student (
     privacy_consent BOOLEAN NOT NULL DEFAULT FALSE,
     privacy_consent_at TIMESTAMP
 );
+ALTER TABLE student ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE student ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE student ADD COLUMN IF NOT EXISTS profile_photo TEXT;
+ALTER TABLE student ADD COLUMN IF NOT EXISTS privacy_consent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE student ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
+ALTER TABLE student ADD COLUMN IF NOT EXISTS academic_career_goals TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_student_email ON student(email) WHERE email IS NOT NULL AND email <> '';
 
 CREATE TABLE IF NOT EXISTS course (
     course_id SERIAL PRIMARY KEY,
@@ -48,13 +55,14 @@ CREATE TABLE IF NOT EXISTS completed_courses (
 CREATE INDEX IF NOT EXISTS idx_completed_courses_student ON completed_courses(student_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_completed_courses_student_course ON completed_courses(student_id, course_id);
 
-
 CREATE TABLE IF NOT EXISTS course_prerequisites (
     prereq_id SERIAL PRIMARY KEY,
     course_id INT REFERENCES course(course_id) ON DELETE CASCADE,
     prerequisite_course_id INT REFERENCES course(course_id) ON DELETE CASCADE,
     UNIQUE (course_id, prerequisite_course_id)
 );
+ALTER TABLE course_prerequisites ADD COLUMN IF NOT EXISTS relation_type VARCHAR(10) NOT NULL DEFAULT 'pre';
+ALTER TABLE course_prerequisites ADD COLUMN IF NOT EXISTS alt_group INT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS recommendation (
     recommendation_id SERIAL PRIMARY KEY,
@@ -83,8 +91,12 @@ CREATE TABLE IF NOT EXISTS password_reset_otp (
     used BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE password_reset_otp ALTER COLUMN student_id DROP NOT NULL;
+ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS purpose VARCHAR(20) NOT NULL DEFAULT 'reset';
+ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS identifier TEXT;
+ALTER TABLE password_reset_otp ADD COLUMN IF NOT EXISTS payload JSONB;
 CREATE INDEX IF NOT EXISTS idx_password_reset_otp_student ON password_reset_otp(student_id, created_at DESC);
-
+CREATE INDEX IF NOT EXISTS idx_password_reset_otp_identifier ON password_reset_otp(identifier, purpose, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS course_ratings (
     rating_id SERIAL PRIMARY KEY,
@@ -106,4 +118,4 @@ CREATE TABLE IF NOT EXISTS ai_explanation_cache (
     explanation TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_ai_explanation_cache_course ON ai_explanation_cache(course_code);
+CREATE INDEX IF NOT EXISTS idx_ai_explanation_cache_course ON ai_explanation_cache(course_code)

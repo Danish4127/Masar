@@ -2,24 +2,27 @@ from pathlib import Path
 import re
 import pandas as pd
 from sqlalchemy import text
-from db import engine
+from db import engine, run_schema
+from prereq import normalize_code as _normalize_code, parse_requirement
 
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_PATH = BASE_DIR / "masar_course_dataset.xlsx"
 
-
 def normalize_code(value) -> str:
-    if pd.isna(value):
-        return ""
-    return re.sub(r"\s+", "", str(value)).strip().upper()
+    return _normalize_code(value)
 
+def _num(value, default=0.0) -> float:
+    try:
+        v = float(value)
+        return default if v != v else v                  
+    except (TypeError, ValueError):
+        return default
 
 def normalize_yes_no(value) -> str:
     if pd.isna(value):
         return "No"
     value = str(value).strip().lower()
     return "Yes" if value.startswith("yes") else "No"
-
 
 def subject_area(course_code: str) -> str:
     prefix = re.match(r"[A-Z]+", course_code or "")
@@ -50,10 +53,9 @@ def subject_area(course_code: str) -> str:
         "HIS": "Humanities & Social Science",
     }.get(prefix.group(0) if prefix else "", "General")
 
-
 def derive_difficulty(row) -> int:
-    level = int(float(row.get("Course_Level") or 100))
-    assessments = int(float(row.get("Number_Major_Assessments") or 0))
+    level = int(_num(row.get("Course_Level"), 100))
+    assessments = int(_num(row.get("Number_Major_Assessments"), 0))
     problem_solving = normalize_yes_no(row.get("Problem_Solving")) == "Yes"
     base = min(5, max(1, level // 100))
     bonus = 1 if assessments >= 5 else 0
@@ -61,39 +63,20 @@ def derive_difficulty(row) -> int:
         bonus = 1
     return min(5, max(1, base + bonus))
 
-
 def derive_math_intensity(row) -> int:
     return 4 if normalize_yes_no(row.get("Has_Math")) == "Yes" else 1
 
-
 def derive_weekly_workload(row) -> int:
-    credits = float(row.get("Credit_Hours") or 0)
-    assessments = float(row.get("Number_Major_Assessments") or 0)
+    credits = _num(row.get("Credit_Hours"), 3)
+    assessments = _num(row.get("Number_Major_Assessments"), 0)
     group_work = normalize_yes_no(row.get("Group_Work_Required")) == "Yes"
     workload = credits * 2 + assessments * 0.5 + (1 if group_work else 0)
     return max(1, int(round(workload)))
-
 
 def clean_prerequisite_text(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
-
-
-def prerequisite_codes(value) -> list[str]:
-    if pd.isna(value) or not str(value).strip():
-        return []
-                                                                             
-                                                                      
-                                                                             
-                                                                     
-                                                                         
-                                                                         
-                                                                        
-    cleaned = re.sub(r"\((?:co|pre|co/pre)\)", "", str(value), flags=re.IGNORECASE)
-    parts = re.split(r",|\band\b|\bor\b|&|/", cleaned, flags=re.IGNORECASE)
-    return [normalize_code(p) for p in parts if normalize_code(p)]
-
 
 def prepare_courses(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["Course_Code", "Course_Name"]).copy()
@@ -127,14 +110,8 @@ def prepare_courses(df: pd.DataFrame) -> pd.DataFrame:
     df["exam_heavy"] = df["Does the course rely more on exams?"].map(normalize_yes_no)
     return df
 
-
 def apply_schema():
-    with open(BASE_DIR / "schema.sql", "r", encoding="utf-8") as f:
-        statements = [s.strip() for s in f.read().split(";") if s.strip()]
-    with engine.begin() as conn:
-        for stmt in statements:
-            conn.execute(text(stmt))
-
+    run_schema()
 
 def migrate_course_columns():
     additions = {
@@ -156,7 +133,6 @@ def migrate_course_columns():
     with engine.begin() as conn:
         for column, definition in additions.items():
             conn.execute(text(f"ALTER TABLE course ADD COLUMN IF NOT EXISTS {column} {definition}"))
-
 
 def seed_courses(course_df: pd.DataFrame) -> dict:
     code_to_id = {}
@@ -211,43 +187,53 @@ def seed_courses(course_df: pd.DataFrame) -> dict:
     print(f"Seeded/updated {len(code_to_id)} courses from the new dataset.")
     return code_to_id
 
+def replace_old_courses(course_codes: list[str], force: bool = False):
+    """Delete courses that are no longer in the dataset.
 
-def replace_old_courses(course_codes: list[str]):
+    Deleting a course cascades to completed_courses / ratings / saved plans, so a
+    truncated Excel file could silently wipe student data. Refuse to remove more
+    than half of the catalog unless --force is given."""
     if not course_codes:
         return
-    placeholders = ", ".join(f":c{i}" for i in range(len(course_codes)))
-    params = {f"c{i}": code for i, code in enumerate(course_codes)}
     with engine.begin() as conn:
-        result = conn.execute(
-            text(f"DELETE FROM course WHERE course_code NOT IN ({placeholders})"),
-            params,
-        )
+        existing = conn.execute(text("SELECT COUNT(*) FROM course")).scalar() or 0
+        stale = conn.execute(text("SELECT COUNT(*) FROM course WHERE course_code <> ALL(:codes)"), {"codes": course_codes}).scalar() or 0
+        if stale and existing and stale > existing / 2 and not force:
+            print(f"SAFETY STOP: {stale} of {existing} existing courses are missing from the dataset. "
+                  "Not deleting them (this would also delete students' completed courses). Re-run with --force if intended.")
+            return
+        result = conn.execute(text("DELETE FROM course WHERE course_code <> ALL(:codes)"), {"codes": course_codes})
     print(f"Removed {result.rowcount} course(s) not present in the new dataset.")
 
-
 def seed_prerequisites(course_df: pd.DataFrame, code_to_id: dict):
+    """Store prerequisite links with their meaning (pre / co, and OR-group number).
+    The recommender reads the text via prereq.parse_requirement; this table is the
+    relational (ER diagram) view of the same information."""
+    inserted = 0
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM course_prerequisites"))
-        inserted = 0
         for _, row in course_df.iterrows():
             course_id = code_to_id.get(row["course_code"])
-            for token in prerequisite_codes(row.get("prerequisite_text")):
-                prereq_id = code_to_id.get(token)
-                if course_id is None or prereq_id is None:
-                    continue
-                conn.execute(
-                    text("""
-                        INSERT INTO course_prerequisites (course_id, prerequisite_course_id)
-                        VALUES (:course_id, :prereq_id)
-                        ON CONFLICT (course_id, prerequisite_course_id) DO NOTHING
-                    """),
-                    {"course_id": course_id, "prereq_id": prereq_id},
-                )
-                inserted += 1
-    print(f"Linked {inserted} prerequisite relationships found within the new dataset.")
+            if course_id is None:
+                continue
+            req = parse_requirement(row.get("prerequisite_text"))
+            for group_no, group in enumerate(req.groups, start=1):
+                for code, kind in group:
+                    prereq_id = code_to_id.get(code)
+                    if prereq_id is None or prereq_id == course_id:
+                        continue
+                    conn.execute(
+                        text("""
+                            INSERT INTO course_prerequisites (course_id, prerequisite_course_id, relation_type, alt_group)
+                            VALUES (:course_id, :prereq_id, :kind, :grp)
+                            ON CONFLICT (course_id, prerequisite_course_id) DO NOTHING
+                        """),
+                        {"course_id": course_id, "prereq_id": prereq_id, "kind": kind, "grp": group_no},
+                    )
+                    inserted += 1
+    print(f"Linked {inserted} prerequisite relationships found within the dataset.")
 
-
-def seed_database():
+def seed_database(force: bool = False):
     apply_schema()
     migrate_course_columns()
     raw_df = pd.read_excel(EXCEL_PATH)
@@ -255,10 +241,10 @@ def seed_database():
     if course_df.empty:
         raise ValueError("The new Excel dataset contains no valid courses.")
     code_to_id = seed_courses(course_df)
-    replace_old_courses(list(code_to_id.keys()))
+    replace_old_courses(list(code_to_id.keys()), force=force)
     seed_prerequisites(course_df, code_to_id)
     print(f"New dataset loaded successfully: {len(course_df)} courses.")
 
-
 if __name__ == "__main__":
-    seed_database()
+    import sys
+    seed_database(force="--force" in sys.argv)

@@ -1,0 +1,40 @@
+{
+  "thresholds": {
+    "high_difficulty": 4,
+    "high_math": 4
+  },
+  "defaults": {
+    "workload_tolerance_hours": 30
+  },
+  "plan_variants": {
+    "safer": {
+      "credit_target_max": 12,
+      "max_high_difficulty": 1,
+      "workload_multiplier": 0.7,
+      "target_credits": 12,
+      "workload_target_share": 0.65
+    },
+    "balanced": {
+      "credit_target_max": 15,
+      "max_high_difficulty": 2,
+      "workload_multiplier": 0.85,
+      "target_credits": 15,
+      "workload_target_share": 0.8
+    },
+    "advanced": {
+      "credit_target_max": 18,
+      "max_high_difficulty": 2,
+      "workload_multiplier": 1.0,
+      "target_credits": 18,
+      "workload_target_share": 0.95
+    }
+  },
+  "fit_scoring": {
+    "goal_bonus_max": 2.4
+  },
+  "math_cap": {
+    "low_confidence_max_high_math_courses": 1,
+    "high_confidence_max_high_math_courses": 3,
+    "confidence_threshold": 4
+  }
+}
