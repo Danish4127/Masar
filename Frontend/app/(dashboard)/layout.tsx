@@ -40,7 +40,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   }, [mobile]);
 
   const current = plans[selectedPlan] || plans.balanced;
-  const activeView = (pathname || "").replace(/^\
+  const activeView = (pathname || "").replace(/^\//, "").split("/")[0] || "catalog";
   const nav = (v: View) => router.push(`/${v}`);
 
   if (isLoggingOut.current) return null;
