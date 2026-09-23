@@ -46,7 +46,7 @@ type AppContextValue = {
 const AppContext = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   const router = useRouter();
   const loggingOutRef = useRef(false);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -71,6 +71,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [welcome, setWelcome] = useState(false);
   const [profileMenu, setProfileMenu] = useState(false);
   const bootedRef = useRef(false);
+  const recommendationRequestRef = useRef(0);
 
   const help = (title: string, body: React.ReactNode) => setModal({ title, body });
   const closeModal = () => setModal(null);
@@ -107,11 +108,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     completed_courses: Array.from(new Set((done || []).map(normalizeCourseCode).filter(Boolean))),
     completed_grades: Object.fromEntries(Object.entries(grades || {}).map(([k, v]) => [normalizeCourseCode(k), v])),
     plan_type,
+    language: lang,
   });
   const refreshPlans = async (s: Student, done: string[]) => {
-    const d = await api<{ plans: Plans }>("/recommend/preview", { method: "POST", body: JSON.stringify(profilePayload(s, done)) });
-    setPlans(d.plans || {});
+    const requestId = ++recommendationRequestRef.current;
+    const payload = profilePayload(s, done);
+    const d = await api<{ plans: Plans }>("/recommend/preview", { method: "POST", body: JSON.stringify(payload) });
+    // Language changes can start a second request while the previous request is still in flight.
+    // Only the newest response may update the roadmap; otherwise an older English response can
+    // overwrite a newer Arabic response (or the other way around).
+    if (requestId === recommendationRequestRef.current) {
+      setPlans(d.plans || {});
+    }
   };
+
+  useEffect(() => {
+    if (!student || !bootedRef.current) return;
+    // Invalidate any older recommendation request immediately when the selected language changes.
+    recommendationRequestRef.current += 1;
+    const requestId = recommendationRequestRef.current;
+    const run = async () => {
+      try {
+        const payload = profilePayload(student, completed);
+        const d = await api<{ plans: Plans }>("/recommend/preview", { method: "POST", body: JSON.stringify(payload) });
+        if (requestId === recommendationRequestRef.current) setPlans(d.plans || {});
+      } catch (e) {
+        if (requestId === recommendationRequestRef.current) {
+          setError(e instanceof Error ? e.message : t("err.couldNotLoadDashboard"));
+        }
+      }
+    };
+    void run();
+    // Refresh recommendation wording whenever the interface language changes so AI explanations
+    // are generated in the currently selected language.
+  }, [lang, student?.student_id, completed.join("|")]);
 
   useEffect(() => {
     if (bootedRef.current) return;

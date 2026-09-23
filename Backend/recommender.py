@@ -198,7 +198,32 @@ def match_percent(course, student_data) -> int:
                                                                            
 def generate_course_reason(course, student_data, taken_with=None) -> str:
     gpa = _num(student_data.get("gpa"), 3.0)
+    language = "ar" if str(student_data.get("language") or "en").lower().startswith("ar") else "en"
     reasons = []
+    if language == "ar":
+        if _is_core(course, student_data):
+            reasons.append("مقرر أساسي لتخصصك")
+        if _goal_alignment(course, student_data) > 0:
+            reasons.append("يتوافق مع أهدافك الأكاديمية أو المهنية")
+        if _num(course.get("difficulty_level"), 3) <= min(5.0, gpa + 1.0) + 0.5:
+            reasons.append(f"يتناسب مع مستواك الأكاديمي (المعدل {gpa:.2f})")
+        else:
+            reasons.append("يمثل تحدياً مناسباً لملفك الأكاديمي الحالي")
+        math_conf = int(_num(student_data.get("math_confidence"), 3))
+        if _num(course.get("math_intensity"), 1) <= math_conf:
+            reasons.append(f"يتناسب مع مستوى ثقتك في الرياضيات ({math_conf}/5)")
+        prog_conf = int(_num(student_data.get("programming_confidence"), 3))
+        if str(course.get("has_programming", "No")) == "Yes" and prog_conf >= 3:
+            reasons.append(f"يتوافق مع مستوى ثقتك في البرمجة ({prog_conf}/5)")
+        workload = _num(course.get("weekly_workload"), 6)
+        if workload <= 6:
+            reasons.append("يساعد على إبقاء عبء الفصل متوازناً")
+        elif workload >= 8:
+            reasons.append("خيار ذو عبء دراسي أعلى لكنه ضمن حدود خطتك الحالية")
+        if taken_with:
+            reasons.append("يُدرس مع " + ", ".join(taken_with) + " (متطلب مصاحب)")
+        return "تم ترشيح هذا المقرر لأنه " + "؛ ".join(reasons) + "."
+
     if _is_core(course, student_data):
         reasons.append("is a core course for your major")
     if _goal_alignment(course, student_data) > 0:
@@ -251,6 +276,7 @@ def _ai_facts(rec: dict, student_data: dict) -> dict:
         "student_math_confidence": int(_num(student_data.get("math_confidence"), 3)),
         "student_programming_confidence": int(_num(student_data.get("programming_confidence"), 3)),
         "student_workload_tolerance_hours": int(_num(student_data.get("workload_tolerance"), DEFAULT_WORKLOAD_TOLERANCE)),
+        "language": "ar" if str(student_data.get("language") or "en").lower().startswith("ar") else "en",
         "rating_scale_max": 5,
     }
 

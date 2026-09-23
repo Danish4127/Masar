@@ -137,6 +137,7 @@ class StudentProfileRequest(BaseModel):
     completed_courses: List[str] = Field(default_factory=list, max_length=80)
     completed_grades: dict[str, str] = Field(default_factory=dict)
     plan_type: str = "balanced"
+    language: str = "en"
     privacy_consent: Optional[bool] = None
 
     @field_validator("completed_courses", mode="before")
@@ -256,6 +257,7 @@ def _student_data(profile: StudentProfileRequest) -> dict:
         "workload_tolerance": profile.workload_tolerance,
         "major": profile.academic_major,
         "academic_career_goals": profile.academic_career_goals,
+        "language": "ar" if str(profile.language or "en").lower().startswith("ar") else "en",
     }
 
 def _validate_completed_grades(course_codes: List[str], grades: dict[str, str] | None = None) -> dict[str, str]:
@@ -689,6 +691,112 @@ def preview_plans(profile: StudentProfileRequest, credentials: HTTPAuthorization
     (it can trigger AI calls, so it must not be open to anonymous traffic)."""
     _require_student(credentials, profile.student_id)
     return {"success": True, "plans": generate_all_plans(_student_data(profile), profile.completed_courses)}
+
+
+class PlanExplanationRequest(StudentProfileRequest):
+    language: str = "en"
+
+
+def _plan_explanation_fallback(plan: dict, profile: StudentProfileRequest, language: str) -> dict[str, str]:
+    recs = plan.get("recommendations") or []
+    excluded = [x for x in (plan.get("excluded") or []) if x.get("reason_code") != "already_completed"]
+    credits = int(plan.get("total_credits") or 0)
+    workload = int(plan.get("total_workload") or 0)
+    target = int(plan.get("target_credits") or 18)
+    risk = str(plan.get("risk_level") or "Medium")
+    risk_text = {"Low": "Low", "Medium": "Medium", "High": "High"}.get(risk, risk)
+    names = ", ".join(f"{x.get('course_code')}: {x.get('course_name')}" for x in recs[:6])
+    reason_counts = {}
+    for item in excluded:
+        code = item.get("reason_code") or "other"
+        reason_counts[code] = reason_counts.get(code, 0) + 1
+    reason_labels = {
+        "missing_prereq": "missing prerequisites",
+        "credit_hours": "credit-hour requirements",
+        "credit_limit": "the credit target",
+        "workload_limit": "the workload budget",
+        "high_difficulty_cap": "the high-difficulty course limit",
+        "high_math_cap": "the math-intensive course limit",
+        "corequisite_not_selected": "a required co-requisite combination",
+    }
+    why_not = ", ".join(f"{n} due to {reason_labels.get(k, 'plan constraints')}" for k, n in reason_counts.items())
+    if not why_not:
+        why_not = "the plan's eligibility and workload constraints"
+    complexity = "Low" if risk == "Low" else ("Medium" if risk == "Medium" else "High")
+    if str(language).lower().startswith("ar"):
+        return {
+            "summary": f"اقترح مسار بناءً على ملفك الأكاديمي ومتطلبات المقررات وقيود الخطة. تحتوي الخطة الحالية على {credits} ساعات معتمدة من أصل {target}، وعبء دراسة تقديري قدره {workload} ساعة أسبوعياً، ومستوى تعقيد {complexity}.",
+            "profile_fit": f"تأخذ الخطة في الاعتبار معدلك {profile.gpa:.2f} وثقتك في الرياضيات ({profile.math_confidence}/5) والبرمجة ({profile.programming_confidence}/5) وحدّ تحمل عبء الدراسة لديك ({profile.workload_tolerance} ساعة أسبوعياً). المقررات المختارة هي {names or 'المقررات المؤهلة التي حققت أعلى ملاءمة ضمن القيود'}.",
+            "workload": f"إجمالي عبء الخطة هو {workload} ساعة أسبوعياً مقابل حد تحمل قدره {profile.workload_tolerance} ساعة. لذلك يظهر مستوى التعقيد في هذه الخطة كـ {complexity} وفق تصنيف عبء العمل في Masar، والذي يقارن عبء الخطة بقدرة الطالب الأسبوعية.",
+            "exclusions": f"لم تُدرج بعض المقررات الأخرى بسبب {why_not}. هذه الأسباب تأتي من محرك التوصية نفسه؛ طبقة الذكاء الاصطناعي تشرحها ولا تغيّر قرار الاختيار."
+        }
+    return {
+        "summary": f"Masar built this semester plan from your academic profile, course requirements and plan constraints. The current plan contains {credits} credits out of a {target}-credit target, an estimated {workload} hours of weekly study, and {complexity} overall complexity.",
+        "profile_fit": f"The plan uses your GPA ({profile.gpa:.2f}), math confidence ({profile.math_confidence}/5), programming confidence ({profile.programming_confidence}/5), and workload tolerance ({profile.workload_tolerance} hours/week). The selected courses are {names or 'the eligible courses with the strongest fit within the plan constraints'}.",
+        "workload": f"The plan totals {workload} hours of study per week against your {profile.workload_tolerance}-hour tolerance. Masar therefore reports the plan's overall complexity as {complexity} using its workload-to-tolerance risk classification.",
+        "exclusions": f"Some other courses were not included because of {why_not}. These reasons come from the recommendation engine itself; the AI layer explains them but does not change the selection."
+    }
+
+
+@app.post("/recommend/explain-plan")
+def explain_recommended_plan(payload: PlanExplanationRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    """Explain an already-computed plan. The rule engine remains the source of the decision."""
+    _require_student(credentials, payload.student_id)
+    if payload.plan_type not in PLAN_VARIANTS:
+        raise HTTPException(status_code=400, detail=f"plan_type must be one of {list(PLAN_VARIANTS.keys())}")
+    cfg = PLAN_VARIANTS[payload.plan_type]
+    student_data = _student_data(payload)
+    recs_df, excluded, message = generate_recommendations(
+        student_data, payload.completed_courses,
+        credit_target_max=cfg["credit_target_max"], max_high_difficulty=cfg["max_high_difficulty"],
+        workload_multiplier=cfg["workload_multiplier"], plan_label=payload.plan_type.capitalize(),
+        use_ai=False, workload_target_share=cfg["workload_target_share"],
+    )
+    recs = records(recs_df)
+    total_credits = int(sum(r.get("credits") or 0 for r in recs))
+    total_workload = int(sum(r.get("weekly_workload") or 0 for r in recs))
+    plan = {
+        "recommendations": recs,
+        "excluded": excluded,
+        "message": message,
+        "total_credits": total_credits,
+        "target_credits": cfg["target_credits"],
+        "total_workload": total_workload,
+        "risk_level": compute_risk_level(total_workload, payload.workload_tolerance),
+    }
+    facts = {
+        "language": "ar" if str(payload.language).lower().startswith("ar") else "en",
+        "plan_type": payload.plan_type,
+        "student_profile": {
+            "gpa": round(payload.gpa, 2),
+            "math_confidence": payload.math_confidence,
+            "programming_confidence": payload.programming_confidence,
+            "workload_tolerance_hours": payload.workload_tolerance,
+            "academic_major": payload.academic_major or "",
+        },
+        "plan": {
+            "credits": total_credits,
+            "target_credits": cfg["target_credits"],
+            "weekly_workload_hours": total_workload,
+            "risk_level": plan["risk_level"],
+        },
+        "selected_courses": [
+            {"course_code": r.get("course_code"), "course_name": r.get("course_name"), "credits": r.get("credits"),
+             "difficulty_level": r.get("difficulty_level"), "math_intensity": r.get("math_intensity"),
+             "weekly_workload": r.get("weekly_workload"), "core_for_major": bool(r.get("core_for_major")),
+             "taken_with": r.get("taken_with") or []}
+            for r in recs
+        ],
+        "not_included_courses": [
+            {"course_code": r.get("course_code"), "course_name": r.get("course_name"),
+             "reason_code": r.get("reason_code"), "reason": r.get("reason")}
+            for r in excluded[:24]
+        ],
+    }
+    fallback = _plan_explanation_fallback(plan, payload, facts["language"])
+    ai_text = ai_explanation.generate_plan_explanation(facts)
+    return {"success": True, "source": "ai" if ai_text else "rule", "explanation": ai_text or fallback}
+
 
 @app.post("/recommend")
 def get_recommendation(profile: StudentProfileRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):

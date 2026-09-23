@@ -6,13 +6,15 @@ import { RecommendationPage, View } from "../../../lib/shared";
 
 export default function RecommendationsRoute() {
   const router = useRouter();
-  const { student, plans, selectedPlan, dataLoading, help } = useApp();
+  const { student, plans, selectedPlan, completed, dataLoading, help } = useApp();
   if (!student) return null;
   const current = plans[selectedPlan] || plans.balanced;
   return (
     <RecommendationPage
       student={student}
       plan={current}
+      planType={selectedPlan}
+      completedCourses={completed}
       loading={dataLoading}
       onNavigate={(v: View) => router.push(`/${v}`)}
       onModal={help}

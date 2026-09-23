@@ -42,7 +42,7 @@ from db import engine
 
 logger = logging.getLogger("masar.ai_explanations")
 
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v7-language-validated"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_API_BASE = "https://api.groq.com/openai/v1"
 MIN_TIMEOUT_SECONDS = 5.0
@@ -91,23 +91,29 @@ def _set_status(ok: bool, detail: str) -> None:
     last_status.update({"ok": ok, "detail": detail, "at": time.time()})
 
                                                                            
-SYSTEM_PROMPT = """You are the natural-language explanation layer of an academic course recommendation system.
-The recommendation engine has ALREADY decided which courses are recommended. Only turn the supplied facts into short explanations.
+def _course_system_prompt(language: str) -> str:
+    language_name = "Arabic" if str(language).lower().startswith("ar") else "English"
+    return f"""You are the natural-language explanation layer of an academic course recommendation system.
+The recommendation engine has ALREADY decided which courses are recommended. Only turn the supplied facts into short explanations in {language_name}.
 
 Rules:
+- Write ONLY in {language_name}; do not mix English explanation sentences into Arabic mode. Course codes and official course names may remain in their original form.
 - Do not change, rank, approve, reject or re-score any recommendation.
 - Use ONLY the supplied facts. Never invent prerequisites, grades, skills, goals, benefits or scores.
 - Never mention a student name, student ID, email or password.
 - Do not introduce numbers that are not in the facts. The rating scale is 1 to 5.
 - Do not promise GPA or academic-success outcomes.
-- Write 1-2 plain, friendly sentences per course, addressed to the student ("you"), simple English.
+- Write 1-2 plain, friendly sentences per course, addressed to the student (you).
 - Mention why the course fits the student's GPA, confidence levels or workload facts.
 - If "taken_with" is not empty, mention that it is taken together with those courses.
 - Return ONLY a JSON object whose keys are the exact course codes given and whose values are the explanation strings."""
 
 def _build_messages(items: list[dict]) -> list[dict]:
+    language = "en"
+    if items and isinstance(items[0].get("facts"), dict):
+        language = str(items[0]["facts"].get("language") or "en")
     user = json.dumps({"course_facts": items, "output_format": {"COURSE_CODE": "short explanation"}}, ensure_ascii=False)
-    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": _course_system_prompt(language)}, {"role": "user", "content": user}]
 
                                                                            
 def _parse_json_object(content: str) -> dict[str, str]:
@@ -149,6 +155,12 @@ def _allowed_numbers(facts: Any) -> set[str]:
     collect(facts)
     return allowed
 
+def _has_arabic_text(value: str) -> bool:
+    # Arabic explanations must contain actual Arabic-script text. English
+    # course names/codes are allowed, but an all-English answer is rejected.
+    return len(re.findall(r"[\u0600-\u06FF]", value or "")) >= 4
+
+
 def _validate(explanation: str, facts: dict) -> bool:
     if not isinstance(explanation, str):
         return False
@@ -157,6 +169,9 @@ def _validate(explanation: str, facts: dict) -> bool:
         return False
     lowered = explanation.lower()
     if any(p in lowered for p in ("student id", "student_id", "email", "password")):
+        return False
+    language = str(facts.get("language") or "en").lower()
+    if language.startswith("ar") and not _has_arabic_text(explanation):
         return False
     allowed = _allowed_numbers(facts)
     return all(n in allowed for n in re.findall(r"\d+(?:\.\d+)?", explanation))
@@ -361,6 +376,114 @@ def generate_ai_explanations(course_facts: list[dict]) -> dict[str, str]:
     _set_status(True, f"{len(rows)} generated, {rejected} rejected/missing")
     if rejected:
         logger.info("AI explanations: %d valid, %d rejected or missing (deterministic text used for those).", len(rows), rejected)
+    return result
+
+
+def _plan_messages(facts: dict) -> list[dict]:
+    language = "Arabic" if str(facts.get("language")).lower().startswith("ar") else "English"
+    system = f"""You are the explanation layer of the Masar academic recommendation system.\nThe deterministic recommendation engine has ALREADY selected the semester plan. Your job is only to explain that decision in {language}.\n\nRules:\n- Never change, rank, approve, reject, or re-score the plan.\n- Use ONLY the supplied facts. Never invent prerequisites, grades, goals, course benefits, or scores.\n- Do not mention student name, student ID, email, password, or other identifying information.\n- Do not introduce numbers that are not present in the supplied facts.\n- Explain why the selected courses fit the profile, how the workload and reported plan risk/complexity relate to the student's workload tolerance, and why some alternatives were not included.\n- Distinguish facts from interpretation. Use cautious wording such as 'Masar selected' rather than promising academic success.\n- Keep each field concise but meaningful: summary 2-3 sentences; profile_fit 2-4 sentences; workload 2-4 sentences; exclusions 2-4 sentences.\n- Return ONLY a JSON object with exactly these keys: summary, profile_fit, workload, exclusions."""
+    return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(facts, ensure_ascii=False)}]
+
+
+def _call_plan_provider(facts: dict, cfg: dict) -> dict[str, str]:
+    payload: dict = {
+        "model": cfg["model"],
+        "messages": _plan_messages(facts),
+        "temperature": 0.2,
+        "max_completion_tokens": 1200,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in cfg["model"]:
+        payload["reasoning_effort"] = "low"
+    headers = {"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"}
+    deadline = time.monotonic() + min(cfg["budget"], 20.0)
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 1.5:
+            raise _ProviderError("time budget exhausted")
+        try:
+            with _PROVIDER_SLOTS:
+                resp = requests.post(f"{cfg['base']}/chat/completions", headers=headers, json=payload,
+                                     timeout=(min(5.0, remaining), min(cfg["timeout"], remaining)))
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt >= cfg["retries"]:
+                raise _ProviderError(f"{type(exc).__name__}") from exc
+            attempt += 1
+            time.sleep(min(1.5 * 2 ** (attempt - 1), 4, max(0, deadline - time.monotonic() - 1)))
+            continue
+        if resp.status_code == 400 and "response_format" in payload and "response_format" in resp.text.lower():
+            payload.pop("response_format")
+            continue
+        if resp.status_code in (401, 403):
+            raise _ProviderError(f"HTTP {resp.status_code} (check AI_API_KEY / model access)", fatal=True)
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if attempt >= cfg["retries"]:
+                raise _ProviderError(f"HTTP {resp.status_code} after {attempt + 1} attempt(s)")
+            wait = min(_retry_after(resp) or 1.5 * 2 ** attempt, 6.0)
+            attempt += 1
+            time.sleep(min(wait, max(0.0, deadline - time.monotonic() - 1)))
+            continue
+        if resp.status_code >= 400:
+            raise _ProviderError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            choice = (resp.json().get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+        except ValueError as exc:
+            raise _ProviderError("invalid JSON from provider") from exc
+        result = _parse_json_object(content)
+        return result
+
+
+def _valid_plan_text(value: str, facts: dict) -> bool:
+    if not isinstance(value, str) or not 35 <= len(value.strip()) <= 900:
+        return False
+    lowered = value.lower()
+    if any(p in lowered for p in ("student id", "student_id", "email", "password")):
+        return False
+    language = str(facts.get("language") or "en").lower()
+    if language.startswith("ar") and not _has_arabic_text(value):
+        return False
+    allowed = _allowed_numbers(facts)
+    return all(n in allowed for n in re.findall(r"\d+(?:\.\d+)?", value))
+
+
+def generate_plan_explanation(facts: dict) -> dict[str, str]:
+    """Explain one already-computed plan. Returns an empty dict when AI is unavailable."""
+    global _cooldown_until
+    if not isinstance(facts, dict):
+        return {}
+    cfg = _cfg()
+    if not (cfg["enabled"] and cfg["key"]):
+        return {}
+    key = hashlib.sha256(json.dumps({"v": CACHE_VERSION, "type": "plan", "model": cfg["model"], "facts": facts},
+                                    sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+    cached = _mem_get(key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+    if time.monotonic() < _cooldown_until:
+        return {}
+    try:
+        generated = _call_plan_provider(facts, cfg)
+    except _ProviderError as exc:
+        _cooldown_until = time.monotonic() + (300 if exc.fatal else 45)
+        _set_status(False, str(exc))
+        logger.warning("Plan explanation unavailable (%s) - using deterministic explanation.", exc)
+        return {}
+    except Exception as exc:
+        _cooldown_until = time.monotonic() + 45
+        _set_status(False, f"{type(exc).__name__}: {exc}")
+        logger.warning("Plan explanation failed unexpectedly: %s", exc)
+        return {}
+    result = {k: str(generated.get(k, "")).strip() for k in ("summary", "profile_fit", "workload", "exclusions")}
+    if not all(_valid_plan_text(v, facts) for v in result.values()):
+        _set_status(False, "plan explanation validation rejected provider output")
+        return {}
+    _mem_put(key, json.dumps(result, ensure_ascii=False))
+    _set_status(True, "plan explanation generated")
     return result
 
 def reset_state_for_tests() -> None:
