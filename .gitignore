@@ -41,3 +41,7 @@ htmlcov/
 # Temporary files
 *.tmp
 *.temp
+
+# TypeScript / Next.js build artifacts
+Frontend/*.tsbuildinfo
+Frontend/next-env.d.ts
